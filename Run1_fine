@@ -1,0 +1,1793 @@
+/*
+ * Smart_Probe_Test.cpp
+ *
+ * Created: 17-03-2026 12:43:42
+ * Author : cw
+ */ 
+
+/*
+ * Portable_Probe_RS485_ANLG.cpp
+ *
+ * Created: 27-01-2025 12:37:12
+ * Author : cw
+ */ 
+
+
+#define F_CPU  3333333UL
+#define PERIOD_EXAMPLE_VALUE (0x1299)// generates 350 Hz pwm at unit div 4761
+#define DUTY_CYCLE_EXAMPLE_VALUE (0x0000)//(0x000A)
+#define USART0_BAUD_RATE(BAUD_RATE) ((float)(F_CPU * 64 / (16 *(float)BAUD_RATE)) + 0.5)
+#define USART1_BAUD_RATE(BAUD_RATE) ((float)(F_CPU * 64 / (16 *(float)BAUD_RATE)) + 0.5)
+#define PERIOD_EXAMPLE_VALUE_H (250)
+#define DUTY_CYCLE_EXAMPLE_VALUE_H (10)//(227)
+#include <avr/io.h>
+#include <avr/sfr_defs.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
+#include <stdint-gcc.h>
+#include <avr/sleep.h>
+#include <avr/pgmspace.h>
+#include <stdbool.h>
+#include <math.h>
+
+#define I2C_TIMEOUT 10000
+
+#define I2C_SCL   (1<<0)
+#define I2C_SDA   (1<<1)
+
+#define I2C_STATE_IS_HIGH(x) ((TWI0.MSTATUS & (x)) == (x))
+#define I2C_STATE_IS_LOW(x) ((TWI0.MSTATUS & (x)) != (x))
+#define I2C_BUS_STATE (TWI0.MSTATUS & TWI_BUSSTATE_gm)
+
+#define I2C_BUS_NOT_IDLE I2C_STATE_IS_LOW(TWI_BUSSTATE_IDLE_gc)
+#define I2C_BUS_IDLE I2C_STATE_IS_HIGH(TWI_BUSSTATE_IDLE_gc)
+
+#define I2C_BUS_NOT_BUSY I2C_STATE_IS_LOW(TWI_BUSSTATE_BUSY_gc)
+#define I2C_BUS_BUSY I2C_STATE_IS_HIGH(TWI_BUSSTATE_BUSY_gc)
+
+#define I2C_BUS_NOT_OWNER I2C_STATE_IS_LOW(TWI_BUSSTATE_OWNER_gc)
+#define I2C_BUS_OWNER I2C_STATE_IS_HIGH(TWI_BUSSTATE_OWNER_gc)
+
+#define I2C_NOT_CLOCKHOLD I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)
+#define I2C_CLOCKHOLD I2C_STATE_IS_HIGH(TWI_CLKHOLD_bm)
+
+#define I2C_NOT_BUSERR I2C_STATE_IS_LOW(TWI_BUSERR_bm)
+#define I2C_BUSERR I2C_STATE_IS_HIGH(TWI_BUSERR_bm)
+
+#define I2C_NOT_ARBLOST I2C_STATE_IS_LOW(TWI_ARBLOST_bm)
+#define I2C_ARBLOST I2C_STATE_IS_HIGH(TWI_ARBLOST_bm)
+
+#define TWI0_BAUD(F_SCL, T_RISE) ((((((float)F_CPU / (float)F_SCL)) - 10 - ((float)F_CPU * T_RISE / 1000000))) / 2)
+
+#define MASTER_ENABLE	1
+#define MASTER_DISABLE	0
+#define SLAVE_ENABLE	1
+#define SLAVE_DISABLE	0
+
+#define I2C_READ 0x01
+#define I2C_WRITE 0x00
+#define I2C_WAIT_TIMEOUT	512//0xFF
+
+#define RETURN_OK			0
+#define RETURN_FAILED		1
+#define RETURN_NO_SLAVE		2
+#define RETURN_BUS_ERROR	3
+#define RETURN_BUS_ARBLOST	4
+#define RETURN_BUS_BUSY		5
+
+
+#define ADS122C04_ADDR      0x80
+
+// Single Conversion Timeout (millis)
+// The maximum time we will wait for DRDY to go valid for a single conversion
+#define ADS122C04_CONVERSION_TIMEOUT 75
+
+// Define 2/3/4-Wire, Temperature and Raw modes
+#define ADS122C04_4WIRE_MODE         0x0
+#define ADS122C04_3WIRE_MODE         0x1
+#define ADS122C04_2WIRE_MODE         0x2
+#define ADS122C04_TEMPERATURE_MODE   0x3
+#define ADS122C04_RAW_MODE           0x4
+#define ADS122C04_4WIRE_HI_TEMP      0x5
+#define ADS122C04_3WIRE_HI_TEMP      0x6
+#define ADS122C04_2WIRE_HI_TEMP      0x7
+
+// ADS122C04 Table 16 in Datasheet
+
+#define ADS122C04_RESET_CMD          0x06     //0000 011x      Reset
+#define ADS122C04_START_CMD          0x08     //0000 100x      Start/Sync
+#define ADS122C04_POWERDOWN_CMD      0x02     //0000 001x      PowerDown
+#define ADS122C04_RDATA_CMD          0x10     //0001 xxxx      RDATA
+#define ADS122C04_RREG_CMD           0x20     //0010 rrxx      Read REG rr= register address 00 to 11
+#define ADS122C04_WREG_CMD           0x40     //0100 rrxx      Write REG rr= register address 00 to 11
+
+#define ADS122C04_WRITE_CMD(reg)     (ADS122C04_WREG_CMD | (reg << 2))    //Shift is 2-bit in ADS122C04
+#define ADS122C04_READ_CMD(reg)      (ADS122C04_RREG_CMD | (reg << 2))    //Shift is 2-bit in ADS122C04
+
+// ADS122C04 Table 16 in Datasheet
+
+#define ADS122C04_CONFIG_0_REG      0 // Configuration Register 0
+#define ADS122C04_CONFIG_1_REG      1 // Configuration Register 1
+#define ADS122C04_CONFIG_2_REG      2 // Configuration Register 2
+#define ADS122C04_CONFIG_3_REG      3 // Configuration Register 3
+
+// Unshifted register definitions
+// The bit field register definitions will do the bit shifting
+
+// Configuration Register 0
+// ADS122C04 Table 19 in Datasheet
+
+// Input Multiplexer Configuration
+#define ADS122C04_MUX_AIN0_AIN1     0x0
+#define ADS122C04_MUX_AIN0_AIN2     0x1
+#define ADS122C04_MUX_AIN0_AIN3     0x2
+#define ADS122C04_MUX_AIN1_AIN0     0x3
+#define ADS122C04_MUX_AIN1_AIN2     0x4
+#define ADS122C04_MUX_AIN1_AIN3     0x5
+#define ADS122C04_MUX_AIN2_AIN3     0x6
+#define ADS122C04_MUX_AIN3_AIN2     0x7
+#define ADS122C04_MUX_AIN0_AVSS     0x8
+#define ADS122C04_MUX_AIN1_AVSS     0x9
+#define ADS122C04_MUX_AIN2_AVSS     0xa
+#define ADS122C04_MUX_AIN3_AVSS     0xb
+#define ADS122C04_MUX_REFPmREFN     0xc
+#define ADS122C04_MUX_AVDDmAVSS     0xd
+#define ADS122C04_MUX_SHORTED       0xe
+
+// Gain Configuration
+#define ADS122C04_GAIN_1            0x0
+#define ADS122C04_GAIN_2            0x1
+#define ADS122C04_GAIN_4            0x2
+#define ADS122C04_GAIN_8            0x3
+#define ADS122C04_GAIN_16           0x4
+#define ADS122C04_GAIN_32           0x5
+#define ADS122C04_GAIN_64           0x6
+#define ADS122C04_GAIN_128          0x7
+
+// PGA Bypass (PGA is disabled when the PGA_BYPASS bit is set)
+#define ADS122C04_PGA_DISABLED      0x1
+#define ADS122C04_PGA_ENABLED       0x0
+
+// Configuration Register 1
+// ADS122C04 Table 19 in Datasheet
+
+// Data Rate
+// Turbo mode = Normal mode * 2 (Samples per Second)
+// Normal mode
+#define ADS122C04_DATA_RATE_20SPS   0x0
+#define ADS122C04_DATA_RATE_45SPS   0x1
+#define ADS122C04_DATA_RATE_90SPS   0x2
+#define ADS122C04_DATA_RATE_175SPS  0x3
+#define ADS122C04_DATA_RATE_330SPS  0x4
+#define ADS122C04_DATA_RATE_600SPS  0x5
+#define ADS122C04_DATA_RATE_1000SPS 0x6
+
+// Operating Mode
+#define ADS122C04_OP_MODE_NORMAL    0x0
+#define ADS122C04_OP_MODE_TURBO     0x1
+
+// Conversion Mode
+#define ADS122C04_CONVERSION_MODE_SINGLE_SHOT   0x0
+#define ADS122C04_CONVERSION_MODE_CONTINUOUS    0x1
+
+// Voltage Reference Selection
+#define ADS122C04_VREF_INTERNAL            0x0 //2.048V internal
+#define ADS122C04_VREF_EXT_REF_PINS        (0x1) //REFp and REFn external
+#define ADS122C04_VREF_AVDD                0x2 //Analog Supply AVDD and AVSS
+
+// Temperature Sensor Mode
+#define ADS122C04_TEMP_SENSOR_OFF          0x0
+#define ADS122C04_TEMP_SENSOR_ON           0x1
+
+// Configuration Register 2
+// ADS122C04 Table 22 in Datasheet
+
+// Conversion Result Ready Flag (READ ONLY)
+
+// Data Counter Enable
+#define ADS122C04_DCNT_DISABLE             0x0
+#define ADS122C04_DCNT_ENABLE              0x1
+
+// Data Integrity Check Enable
+#define ADS122C04_CRC_DISABLED             0x0
+#define ADS122C04_CRC_INVERTED             0x1
+#define ADS122C04_CRC_CRC16_ENABLED        0x2
+
+// Burn-Out Current Source
+#define ADS122C04_BURN_OUT_CURRENT_OFF     0x0
+#define ADS122C04_BURN_OUT_CURRENT_ON      0x1
+
+// IDAC Current Setting
+#define ADS122C04_IDAC_CURRENT_OFF         0x0
+#define ADS122C04_IDAC_CURRENT_10_UA       0x1
+#define ADS122C04_IDAC_CURRENT_50_UA       0x2
+#define ADS122C04_IDAC_CURRENT_100_UA      0x3
+#define ADS122C04_IDAC_CURRENT_250_UA      0x4
+#define ADS122C04_IDAC_CURRENT_500_UA      0x5
+#define ADS122C04_IDAC_CURRENT_1000_UA     0x6
+#define ADS122C04_IDAC_CURRENT_1500_UA     0x7
+
+// Configuration Register 3
+// ADS122C04 Table 23 in Datasheet
+
+// IDAC1 Routing Configuration
+#define ADS122C04_IDAC1_DISABLED           0x0
+#define ADS122C04_IDAC1_AIN0               0x1
+#define ADS122C04_IDAC1_AIN1               0x2
+#define ADS122C04_IDAC1_AIN2               0x3
+#define ADS122C04_IDAC1_AIN3               0x4
+#define ADS122C04_IDAC1_REFP               0x5
+#define ADS122C04_IDAC1_REFN               0x6
+
+// IDAC2 Routing Configuration
+#define ADS122C04_IDAC2_DISABLED           0x0
+#define ADS122C04_IDAC2_AIN0               0x1
+#define ADS122C04_IDAC2_AIN1               0x2
+#define ADS122C04_IDAC2_AIN2               0x3
+#define ADS122C04_IDAC2_AIN3               0x4
+#define ADS122C04_IDAC2_REFP               0x5
+#define ADS122C04_IDAC2_REFN               0x6
+
+
+#define ADC_RESET PIN7_bm // PB5
+
+#define RSDIR PIN4_bm // PA4
+
+
+
+bool I2C_RawRead(uint8_t ACK);
+void InitI2C();
+bool I2C_RawStart(uint8_t deviceAddr, uint8_t Direction);
+bool I2C_RawWrite(uint8_t write_data);
+bool I2C_RawStop(void);
+unsigned char I2C_ReadByte(uint8_t address, uint8_t reg);
+bool I2C_ReadBytes(uint8_t address, uint8_t reg, uint8_t *data, uint8_t size);
+unsigned char I2C_WriteByte(uint8_t address, uint16_t reg, uint8_t data);
+bool I2C_WriteBytes(uint8_t address, uint8_t reg, uint8_t data[], uint8_t size);
+void I2C_StartMaster();
+bool I2C_StopMaster();
+bool I2C_StartSlave();
+bool I2C_StopSlave();
+
+unsigned char rxdata_1;
+
+
+long long int intmp_reading,sensor_output,sensor_pos,sensor_neg,sensor_final_output,pre_adc_value,diff_adc_value,pub_adc_value,pre_disp_value,Reference_Set_Value;
+unsigned char rxdata,rxflag,rxcntr,strt,offset_value;
+unsigned int limit;
+unsigned char memdata;
+
+/* ── ADDED: millis counter for elapsed time measurement ── */
+volatile uint32_t millis_count = 0;
+
+/* Diagnostic globals — read ONCE at startup from struct, printed every line */
+uint8_t  diag_dr   = 0;
+uint8_t  diag_pga  = 0;
+uint8_t  diag_gain = 0;
+
+/* Inter-sample settling delay and DRDY poll timeout.
+   Set by set_inter_sample_delay() based on data rate.
+   4x conversion period for settle (3x needed + 1 tick margin).
+   6x conversion period for DRDY timeout.                        */
+uint16_t inter_sample_delay_ms = 200;
+uint16_t drdy_timeout_ms       = 300;
+
+/* ── ADDED: variables used in run_mode that were missing ── */
+unsigned int upflag = 0;
+unsigned int overrange = 0;
+
+char str1[] = {"0000      "};
+char str2[] = {"0000      "};
+char str3[] = {"0000      "}; // Raw sensor Output with Filter
+
+unsigned char company[150]={' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' ',' '};
+
+
+// Bit field type register configuration
+// Configuration Map register ADS122C04
+//--------------Address 0x00---------------------------------
+struct CONFIG_REG_0{
+	uint8_t PGA_BYPASS:1;                           // 0
+	uint8_t GAIN:3;                                 // 1-3
+	uint8_t MUX:4;                                  // 4-7
+};
+union CONFIG_REG_0_U {
+	uint8_t all;
+	struct CONFIG_REG_0 bit;
+};
+
+//--------------Address 0x01---------------------------------
+struct CONFIG_REG_1{
+	uint8_t TS:1;                                   // 0
+	uint8_t VVREF:2;                                 // 1-2
+	uint8_t CMBIT:1;                                // 3
+	uint8_t MODE:1;                                 // 4
+	uint8_t DR:3;                                   // 5-7
+};
+union CONFIG_REG_1_U {
+	uint8_t all;
+	struct CONFIG_REG_1 bit;
+};
+
+//--------------Address 0x02---------------------------------
+struct CONFIG_REG_2{
+	uint8_t IDAC:3;                                 // 0-2
+	uint8_t BCS:1;                                  // 3
+	uint8_t CRCbits:2;                              // 4-5
+	uint8_t DCNT:1;                                 // 6
+	uint8_t DRDY:1;                                 // 7
+};
+union CONFIG_REG_2_U {
+	uint8_t all;
+	struct CONFIG_REG_2 bit;
+};
+
+//--------------Address 0x03---------------------------------
+struct CONFIG_REG_3{
+	uint8_t RESERVED:2;                             // 0-1
+	uint8_t I2MUX:3;                                // 2-4
+	uint8_t I1MUX:3;                                // 5-7
+};
+union CONFIG_REG_3_U {
+	uint8_t all;
+	struct CONFIG_REG_3 bit;
+};
+
+// All four registers
+typedef struct ADS122C04Reg{
+	union CONFIG_REG_0_U reg0;
+	union CONFIG_REG_1_U reg1;
+	union CONFIG_REG_2_U reg2;
+	union CONFIG_REG_3_U reg3;
+} ADS122C04Reg_t;
+
+// Union for the 14-bit internal Temperature
+// To simplify converting from uint16_t to int16_t
+// without using a cast
+union internal_temperature_union{
+	int16_t INT16;
+	uint16_t UINT16;
+};
+
+// Union for the 24-bit raw voltage
+// To simplify converting from uint32_t to int32_t
+// without using a cast
+union raw_voltage_union{
+	int32_t INT32;
+	uint32_t UINT32;
+};
+
+// struct to hold the initialization parameters
+typedef struct{
+	uint8_t inputMux;
+	uint8_t gainLevel;
+	uint8_t pgaBypass;
+	uint8_t dataRate;
+	uint8_t opMode;
+	uint8_t convMode;
+	uint8_t selectVref;
+	uint8_t tempSensorEn;
+	uint8_t dataCounterEn;
+	uint8_t dataCRCen;
+	uint8_t burnOutEn;
+	uint8_t idacCurrent;
+	uint8_t routeIDAC1;
+	uint8_t routeIDAC2;
+} ADS122C04_initParam;
+
+/*Using default clock 3.33MHz */
+void TCA0_init(void);
+void PIN_init(void);
+void TCA0_hardReset(void);
+
+// Read the raw signed 24-bit ADC value as int32_t
+// NOTE: readRawVoltage() is NOT called anywhere in this firmware.
+// The actual measurement path is: read_sensor() -> poll_and_read() -> readADC()
+// This function is kept only for reference. The rate parameter here
+// does NOT affect the actual data rate used by read_sensor().
+int32_t readRawVoltage(uint8_t rate = ADS122C04_DATA_RATE_20SPS);
+
+// Read the raw signed 24-bit ADC value as uint32_t
+// The ADC data is returned in the least-significant 24-bits
+uint32_t readADC(void);
+
+// Read the internal temperature (C)
+float readInternalTemperature(uint8_t rate = ADS122C04_DATA_RATE_20SPS);
+
+void reset(void); // Reset the ADS122C04
+void start(void); // Start a conversion
+void ADC_powerdown(void); // Put the chip into low power mode
+
+ // Default to using 'safe' settings (disable the IDAC current sources)
+ void setInputMultiplexer(uint8_t mux_config = ADS122C04_MUX_AIN1_AIN0); // Configure the input multiplexer
+ void setGain(uint8_t gain_config = ADS122C04_GAIN_1); // Configure the gain
+ void enablePGA(uint8_t enable = ADS122C04_PGA_DISABLED); // Enable/disable the Programmable Gain Amplifier
+ void setDataRate(uint8_t rate = ADS122C04_DATA_RATE_20SPS); // Set the data rate (sample speed)
+ void setOperatingMode(uint8_t mode = ADS122C04_OP_MODE_NORMAL); // Configure the operating mode (normal / turbo)
+ void setConversionMode(uint8_t mode = ADS122C04_CONVERSION_MODE_SINGLE_SHOT); // Configure the conversion mode (single-shot / continuous)
+ void setVoltageReference(uint8_t ref = ADS122C04_VREF_INTERNAL); // Configure the voltage reference
+ void enableInternalTempSensor(uint8_t enable = ADS122C04_TEMP_SENSOR_OFF); // Enable / disable the internal temperature sensor
+ void setDataCounter(uint8_t enable = ADS122C04_DCNT_DISABLE); // Enable / disable the conversion data counter
+ void setDataIntegrityCheck(uint8_t setting = ADS122C04_CRC_DISABLED); // Configure the data integrity check
+ void setBurnOutCurrent(uint8_t enable = ADS122C04_BURN_OUT_CURRENT_OFF); // Enable / disable the 10uA burn-out current source
+ void setIDACcurrent(uint8_t current = ADS122C04_IDAC_CURRENT_OFF); // Configure the internal programmable current sources
+ void setIDAC1mux(uint8_t setting = ADS122C04_IDAC1_DISABLED); // Configure the IDAC1 routing
+ void setIDAC2mux(uint8_t setting = ADS122C04_IDAC2_DISABLED); // Configure the IDAC2 routing
+
+ bool checkDataReady(void); // Check the status of the DRDY bit in Config Register 2
+
+ uint8_t getInputMultiplexer(void); // input multiplexer configuration
+ uint8_t getGain(void); // gain setting
+ uint8_t getPGAstatus(void); // Programmable Gain Amplifier status
+ uint8_t getDataRate(void); // data rate (sample speed)
+ uint8_t getOperatingMode(void); // operating mode (normal / turbo)
+ uint8_t getConversionMode(void); // conversion mode (single-shot / continuous)
+ uint8_t getVoltageReference(void); // voltage reference configuration
+ uint8_t getInternalTempSensorStatus(void); // internal temperature sensor status
+ uint8_t getDataCounter(void); // data counter status
+ uint8_t getDataIntegrityCheck(void); // data integrity check configuration
+ uint8_t getBurnOutCurrent(void); // burn-out current status
+ uint8_t getIDACcurrent(void); // IDAC setting
+ uint8_t getIDAC1mux(void); //  IDAC1 MUX configuration
+ uint8_t getIDAC2mux(void); //  IDAC2 MUX configuration
+
+
+// Keep a copy of the wire mode so we can restore it after reading the internal temperature
+uint8_t _wireMode = ADS122C04_RAW_MODE; //Default to using 'safe' settings (disable the IDAC current sources)
+// Resistance of the reference resistor
+const float PT100_REFERENCE_RESISTOR = 1620.0;
+
+// Amplifier gain setting
+// ** MAKE SURE THE CONFIG REGISTER 0 GAIN IS THE SAME AS THIS **
+const float PT100_AMPLIFIER_GAIN = 8.0;
+const float PT100_AMP_GAIN_HI_TEMP = 4.0;
+
+// Internal temperature sensor resolution
+// One 14-bit LSB equals 0.03125 C
+const float TEMPERATURE_SENSOR_RESOLUTION = 0.03125;
+
+ADS122C04Reg_t ADS122C04_Reg; // Global to hold copies of all four configuration registers
+
+
+bool ADS122C04_init(ADS122C04_initParam *param); // initialize the ADS122C04 parameters
+
+void ADS122C04_writeReg(uint8_t reg, uint8_t writeValue); // write a value to the selected register
+bool ADS122C04_readReg(uint8_t reg, uint8_t *readValue); // read a value from the selected register (returned in readValue)
+
+bool ADS122C04_getConversionData(uint32_t *conversionData); // read the raw 24-bit conversion result
+bool ADS122C04_getConversionDataWithCount(uint32_t *conversionData, uint8_t *count); // read the raw conversion result and count (if enabled)
+
+void ADS122C04_sendCommand(uint8_t command); // write to the selected command register
+void ADS122C04_sendCommandWithValue(uint8_t command, uint8_t value); // write a value to the selected command register
+	
+
+
+bool I2C_StopMaster()
+{
+
+	TWI0.MCTRLA &= ~(TWI_ENABLE_bm);
+	PORTB.DIRSET &= ~(I2C_SCL);
+
+	return(RETURN_OK);
+}
+
+bool I2C_RawStart(uint8_t deviceAddr, uint8_t Direction)
+{
+	volatile uint16_t timeout;
+
+	deviceAddr = deviceAddr | Direction; // 1 read, 0 write
+	if (I2C_BUS_NOT_BUSY)
+	{
+		for (volatile uint16_t arbLoop = 0x04; arbLoop > 0; arbLoop--)
+		{
+			//TWI0.MCTRLB &= ~(1 << TWI_ACKACT_bp);
+			TWI0.MADDR = deviceAddr;
+			if (Direction)
+			{
+				// addressRead
+				for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_RIF_bm) && (timeout > 0); timeout--)
+				{
+				}
+			}
+			else
+			{
+
+				// addressWrite
+				for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_WIF_bm) && (timeout > 0); timeout--)
+				{
+				}
+			}
+
+			if (I2C_ARBLOST)
+			{
+				// Arbitration lost - keep retrying.
+				continue;
+			}
+
+			if (I2C_BUSERR)
+			{
+				// Bus error - abort.
+				return(RETURN_BUS_ERROR);		// RETURN_BUS_ERROR);
+			}
+
+			if (I2C_STATE_IS_LOW(TWI_RXACK_bm))
+			{
+				// Slave responding.
+				return(RETURN_OK);		// RETURN_OK);
+			}
+			else
+			{
+				// Slave not responding - abort.
+				return(RETURN_NO_SLAVE);		// RETURN_NO_SLAVE);
+			}
+		}
+	}
+	else
+	{
+		return(RETURN_BUS_BUSY);		// RETURN_BUS_BUSY);
+	}
+
+	return(RETURN_BUS_ARBLOST);		// RETURN_BUS_ARBLOST);
+}
+
+bool I2C_RawStop(void)
+{
+	volatile uint16_t timeout;
+
+	for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--)
+	{
+		// Wait until we have a clock hold.
+	}
+	if (timeout == 0)
+	{
+		
+		return(RETURN_FAILED);
+	}
+
+	TWI0.MCTRLB = TWI_ACKACT_NACK_gc | TWI_MCMD_STOP_gc;
+	//TWI0.MCTRLB = TWI_MCMD_STOP_gc;
+	for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--)
+	{
+		// Wait until we have a clock hold.
+	}
+	if (I2C_BUSERR)
+	{
+		
+		TWI0.MSTATUS = TWI_BUSERR_bm;
+	}
+
+	return(RETURN_OK);
+}
+
+
+void I2C_RawForceStop(void)
+{
+
+	I2C_RawStop();
+	TWI0.MSTATUS |= TWI_BUSSTATE_IDLE_gc;	//Force TWI state machine into IDLE state
+	TWI0.MCTRLB |= TWI_FLUSH_bm;			// Purge MADDR and MDATA
+}
+
+bool I2C_RawWrite(uint8_t write_data)
+{
+	volatile uint16_t timeout;
+
+	if (I2C_BUS_OWNER)
+	{
+		for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--)
+		{
+			// Wait until we have a clock hold.
+		}
+		if (timeout == 0)
+		{
+			// Even though we own the bus, we aren't holding the clock.
+			return(RETURN_FAILED);
+		}
+
+		TWI0.MDATA = write_data;
+		// while (!((TWI0.MSTATUS & TWI_WIF_bm) | (TWI0.MSTATUS & TWI_RXACK_bm))) ;		//Wait until WIF set and RXACK cleared
+
+		for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_WIF_bm) && (timeout > 0); timeout--)
+		{
+		}
+
+		if (I2C_BUSERR)
+		{
+			// Bus error - abort.
+			return(RETURN_BUS_ERROR);		// RETURN_BUS_ERROR);
+			
+		}
+
+		if (I2C_STATE_IS_LOW(TWI_RXACK_bm))
+		{
+			// Slave responding.
+			return(RETURN_OK);		// RETURN_OK);
+		}
+		else
+		{
+			// Slave not responding - abort.
+			return(RETURN_NO_SLAVE);		// RETURN_NO_SLAVE);
+		}
+	}
+
+	return(RETURN_FAILED);
+}
+
+
+
+unsigned char I2C_WriteByte(uint8_t address, uint16_t reg, uint8_t data)
+ {
+unsigned char result=0;
+unsigned int hi_addr,lo_addr;
+hi_addr=reg>>8;
+lo_addr=reg & 0x00FF;
+	if (I2C_BUS_NOT_BUSY)
+	 {
+		if (I2C_RawStart(address, I2C_WRITE))
+		 {
+			I2C_RawStop();
+			return(RETURN_FAILED);
+			result=1;
+		}
+		
+		if (I2C_RawWrite(hi_addr))
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+			result=1;
+		}
+		
+		if (I2C_RawWrite(lo_addr))
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+			result=1;
+		}
+
+
+		if (I2C_RawWrite(data))
+		 {
+			I2C_RawStop();
+			return(RETURN_FAILED);
+			result=1;
+		}
+
+		I2C_RawStop();
+	}
+	else
+	{
+		return(RETURN_BUS_BUSY);		// RETURN_BUS_BUSY);
+		result=1;
+	}
+	return(result);
+}
+bool I2C_RawRead(uint8_t ACK)							// ACK=1 send ACK ; ACK=0 send NACK
+{
+	//volatile uint8_t timeout;
+	volatile uint16_t timeout;
+	
+
+	if (I2C_BUS_OWNER)
+	{
+		for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--)
+		{
+			// Wait until we have a clock hold.
+		}
+		if (timeout == 0)
+		 {
+			// Even though we own the bus, we aren't holding the clock.
+			return(RETURN_FAILED);
+		 }
+
+		//TWI0.MCTRLB &= ~(1 << TWI_ACKACT_bp);
+		if	(ACK == 1)
+		{
+			TWI0.MCTRLB &= ~(1 << TWI_ACKACT_bp);
+		}		
+		else
+		{
+			TWI0.MCTRLB |= (1 << TWI_ACKACT_bp);
+		}	
+
+		for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_RIF_bm) && (timeout > 0); timeout--)
+		 {
+			
+			
+		 }
+		 
+		if (timeout == 0)
+		 {
+			// Timeout on waiting for RIF signal.
+			return(RETURN_FAILED);
+		 }
+
+		//*data = TWI0.MDATA;
+		memdata=TWI0.MDATA;
+		/*if	(ACK == 1)
+		{
+			TWI0.MCTRLB &= ~(1 << TWI_ACKACT_bp);
+		}		
+		else			
+		{
+			TWI0.MCTRLB |= (1 << TWI_ACKACT_bp);	
+		}	
+		         */
+		if (I2C_BUSERR)
+		 {
+			// Bus error - abort.
+			return(RETURN_FAILED);		// RETURN_BUS_ERROR);
+		}
+
+		if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) 
+		{
+			// Slave responding.
+			return(RETURN_OK);		// RETURN_OK);
+		} 
+		else
+		 {
+			// Slave not responding - abort.
+			return(RETURN_FAILED);		// RETURN_NO_SLAVE);
+		}
+	}
+
+	return(RETURN_FAILED);
+	
+	
+}
+unsigned char I2C_ReadByte(uint8_t address, uint16_t reg)
+ {
+	 unsigned int hi_addr,lo_addr;
+	 hi_addr=reg>>8;
+	 lo_addr=reg & 0x00FF;
+
+	if (I2C_BUS_NOT_BUSY)
+	 {
+		if (I2C_RawStart(address, I2C_WRITE)) 
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+		}
+
+		if (I2C_RawWrite(hi_addr))
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+		}
+		
+		if (I2C_RawWrite(lo_addr))
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+		}
+				
+
+		if (I2C_RawStart(address, I2C_READ)) 
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+		}
+
+		if (I2C_RawRead(0))
+		{
+			I2C_RawStop();
+			return(RETURN_FAILED);
+		}
+
+		I2C_RawStop();
+	}
+
+	return(memdata);
+}
+unsigned char I2C_data_read(uint8_t ADDR, uint16_t location )
+{
+	I2C_ReadByte(ADDR, location);
+	return(memdata);
+}
+
+void I2C_StartMaster()
+{
+
+	PORTB.DIRSET = I2C_SCL;
+	PORTB.DIRSET = I2C_SDA;
+	TWI0.CTRLA = TWI_SDAHOLD_500NS_gc | TWI_SDASETUP_8CYC_gc; // Use max SDA setup and hold times to be safe
+	//TWI0.MBAUD = (uint8_t)TWI0_BAUD(100000);	        // set MBAUD register for 100kHz
+	//TWI0.MBAUD = (uint8_t)TWI0_BAUD(100000, 0); /* set MBAUD register */
+	TWI0.MBAUD = (uint8_t)TWI0_BAUD(100000, 1000); /* set MBAUD register */
+	//TWI0.MBAUD = (uint8_t)TWI0_BAUD(200000, 1000); /* set MBAUD register */
+	//TWI0.MBAUD = 35;
+	//TWI0.MBAUD = 0x01;
+	TWI0.MCTRLA = 1 << TWI_ENABLE_bp			/* Enable TWI Master: enabled */
+	| 0 << TWI_QCEN_bp					/* Quick Command Enable: disabled */
+	| 0 << TWI_RIEN_bp					/* Read Interrupt Enable: disabled */
+	| 1 << TWI_SMEN_bp					/* Smart Mode Enable: enabled */
+	| TWI_TIMEOUT_DISABLED_gc				/* Bus Timeout Disabled */
+	| 0 << TWI_WIEN_bp;					/* Write Interrupt Enable: disabled */
+
+	TWI0.MSTATUS = TWI_BUSSTATE_IDLE_gc ;		        //Force TWI state machine into IDLE state
+	TWI0.MSTATUS = (TWI_RIF_bm | TWI_WIF_bm) ;
+	TWI0.MCTRLB = TWI_FLUSH_bm ;				/* Purge MADDR and MDATA */
+
+}
+void InitI2C()
+{
+	I2C_StartMaster();
+}
+
+
+bool start_transmission(char device_address)
+{
+	return(I2C_RawStart(device_address,I2C_WRITE));
+}
+
+bool stop_transmission()
+{
+	return(I2C_RawStop());
+}
+
+void write_on_bus(unsigned char ch)
+{
+	
+	I2C_RawWrite(ch);
+	
+}
+
+void ADS122C04_sendCommand(uint8_t command)
+{
+	start_transmission(ADS122C04_ADDR);
+	write_on_bus(command);
+	stop_transmission();
+	
+}
+
+
+
+void start(void)
+{
+	ADS122C04_sendCommand(ADS122C04_START_CMD);
+}
+
+void reset(void)
+{
+	ADS122C04_sendCommand(ADS122C04_RESET_CMD);
+}
+
+void ADC_powerdown(void)
+{
+	ADS122C04_sendCommand(ADS122C04_POWERDOWN_CMD);
+}
+
+
+void ADS122C04_sendCommandWithValue(uint8_t command, uint8_t value)
+{
+	start_transmission(ADS122C04_ADDR);
+	write_on_bus(command);
+	write_on_bus(value);
+	stop_transmission();
+	
+}
+
+
+void ADS122C04_writeReg(uint8_t reg, uint8_t writeValue)
+{
+	uint8_t command = 0;
+	command = ADS122C04_WRITE_CMD(reg);
+	ADS122C04_sendCommandWithValue(command, writeValue);
+}
+
+bool ADS122C04_readReg(uint8_t reg, uint8_t *readValue)
+{
+	uint8_t command = 0;
+	command = ADS122C04_READ_CMD(reg);
+
+	start_transmission(ADS122C04_ADDR);
+	write_on_bus(command);
+	stop_transmission();
+    if (I2C_RawStart(ADS122C04_ADDR, I2C_READ))
+    {
+	    I2C_RawStop();
+	    //return(RETURN_FAILED);
+    }
+	if (I2C_RawRead(1))
+	{
+		I2C_RawStop();
+		//return(RETURN_FAILED);
+	}
+	else
+	{
+		*readValue=memdata;
+		I2C_RawStop();
+		return(true);
+	}
+
+	return(false);
+}
+
+//Returns true if device answers on _deviceAddress
+bool isConnected(void)
+{
+	return 0;
+}
+
+
+bool ADS122C04_getConversionDataWithCount(uint32_t *conversionData, uint8_t *count)
+{
+	uint8_t RXByte[4] = {0};
+
+	start_transmission(ADS122C04_ADDR);
+	write_on_bus(ADS122C04_RDATA_CMD);
+	stop_transmission();
+
+	if (I2C_RawStart(ADS122C04_ADDR, I2C_READ))
+	{
+		I2C_RawStop();
+		//return(RETURN_FAILED);
+	}
+
+	if (I2C_RawRead(1))
+	{
+		I2C_RawStop();
+		//return(RETURN_FAILED);
+	}
+	RXByte[0]=memdata;
+	if (I2C_RawRead(1))
+	{
+		I2C_RawStop();
+		//return(RETURN_FAILED);
+	}
+	RXByte[1]=memdata;
+	if (I2C_RawRead(1))
+	{
+		I2C_RawStop();
+		//return(RETURN_FAILED);
+	}
+	RXByte[2]=memdata;
+	if (I2C_RawRead(1))
+	{
+		I2C_RawStop();
+		//return(RETURN_FAILED);
+	}
+	RXByte[3]=memdata;
+
+	*count = RXByte[0];
+	*conversionData = ((uint32_t)RXByte[3]) | ((uint32_t)RXByte[2]<<8) | ((uint32_t)RXByte[1]<<16);
+	return(true);
+}
+
+
+bool ADS122C04_getConversionData(uint32_t *conversionData)
+{
+	uint8_t RXByte[3] = {0};
+
+	
+	start_transmission(ADS122C04_ADDR);
+	write_on_bus(ADS122C04_RDATA_CMD);
+	stop_transmission();
+		if (I2C_RawStart(ADS122C04_ADDR, I2C_READ))
+		{
+			I2C_RawStop();
+			//return(RETURN_FAILED);
+		}
+
+		if (I2C_RawRead(1))
+		{
+			I2C_RawStop();
+			//return(RETURN_FAILED);
+		}
+		RXByte[0]=memdata;
+		if (I2C_RawRead(1))
+		{
+			I2C_RawStop();
+			//return(RETURN_FAILED);
+		}
+		RXByte[1]=memdata;
+		if (I2C_RawRead(1))
+		{
+			I2C_RawStop();
+			//return(RETURN_FAILED);
+		}
+		RXByte[2]=memdata;
+
+	*conversionData = ((uint32_t)RXByte[2]) | ((uint32_t)RXByte[1]<<8) | ((uint32_t)RXByte[0]<<16);
+	return(true);
+}
+
+uint32_t readADC(void)
+{
+	uint32_t ret_val; // The return value
+
+	// Read the conversion result
+	if(ADS122C04_getConversionData(&ret_val) == false)
+	{
+		return(0);
+	}
+
+	return(ret_val);
+}
+
+// Configure the input multiplexer
+void setInputMultiplexer(uint8_t mux_config)
+{
+	ADS122C04_Reg.reg0.bit.MUX = mux_config;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_0_REG, ADS122C04_Reg.reg0.all));
+}
+
+// Configure the gain
+void setGain(uint8_t gain_config)
+{
+	
+	ADS122C04_Reg.reg0.bit.GAIN = gain_config;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_0_REG, ADS122C04_Reg.reg0.all));
+}
+
+// Enable/disable the Programmable Gain Amplifier
+void enablePGA(uint8_t enable)
+{
+	ADS122C04_Reg.reg0.bit.PGA_BYPASS = enable;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_0_REG, ADS122C04_Reg.reg0.all));
+}
+
+// Set the data rate (sample speed)
+void setDataRate(uint8_t rate)
+{
+	ADS122C04_Reg.reg1.bit.DR = rate;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_1_REG, ADS122C04_Reg.reg1.all));
+}
+
+// Configure the operating mode (normal / turbo)
+void setOperatingMode(uint8_t mode)
+{
+	ADS122C04_Reg.reg1.bit.MODE = mode;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_1_REG, ADS122C04_Reg.reg1.all));
+}
+
+// Configure the conversion mode (single-shot / continuous)
+void setConversionMode(uint8_t mode)
+{
+	ADS122C04_Reg.reg1.bit.CMBIT = mode;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_1_REG, ADS122C04_Reg.reg1.all));
+}
+
+// Configure the voltage reference
+void setVoltageReference(uint8_t ref)
+{
+	ADS122C04_Reg.reg1.bit.VVREF = ref;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_1_REG, ADS122C04_Reg.reg1.all));
+}
+
+// Enable / disable the internal temperature sensor
+void enableInternalTempSensor(uint8_t enable)
+{
+	
+	ADS122C04_Reg.reg1.bit.TS = enable;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_1_REG, ADS122C04_Reg.reg1.all));
+}
+
+// Enable / disable the conversion data counter
+void setDataCounter(uint8_t enable)
+{
+	
+	ADS122C04_Reg.reg2.bit.DCNT = enable;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_2_REG, ADS122C04_Reg.reg2.all));
+}
+
+// Configure the data integrity check
+void setDataIntegrityCheck(uint8_t setting)
+{
+	ADS122C04_Reg.reg2.bit.CRCbits = setting;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_2_REG, ADS122C04_Reg.reg2.all));
+}
+
+// Enable / disable the 10uA burn-out current source
+void setBurnOutCurrent(uint8_t enable)
+{
+	ADS122C04_Reg.reg2.bit.BCS = enable;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_2_REG, ADS122C04_Reg.reg2.all));
+}
+
+// Configure the internal programmable current sources
+void setIDACcurrent(uint8_t current)
+{
+	ADS122C04_Reg.reg2.bit.IDAC = current;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_2_REG, ADS122C04_Reg.reg2.all));
+}
+
+// Configure the IDAC1 routing
+void setIDAC1mux(uint8_t setting)
+{
+	ADS122C04_Reg.reg3.bit.I1MUX = setting;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_3_REG, ADS122C04_Reg.reg3.all));
+}
+
+// Configure the IDAC2 routing
+void setIDAC2mux(uint8_t setting)
+{
+	ADS122C04_Reg.reg3.bit.I2MUX = setting;
+	(ADS122C04_writeReg(ADS122C04_CONFIG_3_REG, ADS122C04_Reg.reg3.all));
+}
+
+// Read Config Reg 2 and check the DRDY bit
+// Data is ready when DRDY is high
+bool checkDataReady(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+	return(ADS122C04_Reg.reg2.bit.DRDY > 0);
+}
+
+// Get the input multiplexer configuration
+uint8_t getInputMultiplexer(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_0_REG, &ADS122C04_Reg.reg0.all);
+	return(ADS122C04_Reg.reg0.bit.MUX);
+}
+
+// Get the gain setting
+uint8_t getGain(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_0_REG, &ADS122C04_Reg.reg0.all);
+	return(ADS122C04_Reg.reg0.bit.GAIN);
+}
+
+// Get the Programmable Gain Amplifier status
+uint8_t getPGAstatus(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_0_REG, &ADS122C04_Reg.reg0.all);
+	return(ADS122C04_Reg.reg0.bit.PGA_BYPASS);
+}
+
+// Get the data rate (sample speed)
+uint8_t getDataRate(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &ADS122C04_Reg.reg1.all);
+	return(ADS122C04_Reg.reg1.bit.DR);
+}
+
+// Get the operating mode (normal / turbo)
+uint8_t getOperatingMode(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &ADS122C04_Reg.reg1.all);
+	return(ADS122C04_Reg.reg1.bit.MODE);
+}
+// Get the conversion mode (single-shot / continuous)
+uint8_t getConversionMode(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &ADS122C04_Reg.reg1.all);
+	return(ADS122C04_Reg.reg1.bit.CMBIT);
+}
+
+// Get the voltage reference configuration
+uint8_t getVoltageReference(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &ADS122C04_Reg.reg1.all);
+	return(ADS122C04_Reg.reg1.bit.VVREF);
+}
+
+// Get the internal temperature sensor status
+uint8_t getInternalTempSensorStatus(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &ADS122C04_Reg.reg1.all);
+	return(ADS122C04_Reg.reg1.bit.TS);
+}
+
+// Get the data counter status
+uint8_t getDataCounter(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+	return(ADS122C04_Reg.reg2.bit.DCNT);
+}
+
+// Get the data integrity check configuration
+uint8_t getDataIntegrityCheck(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+	return(ADS122C04_Reg.reg2.bit.CRCbits);
+}
+
+// Get the burn-out current status
+uint8_t getBurnOutCurrent(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+	return(ADS122C04_Reg.reg2.bit.BCS);
+}
+
+// Get the IDAC setting
+uint8_t getIDACcurrent(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+	return(ADS122C04_Reg.reg2.bit.IDAC);
+}
+
+// Get the IDAC1 mux configuration
+uint8_t getIDAC1mux(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_3_REG, &ADS122C04_Reg.reg3.all);
+	return(ADS122C04_Reg.reg3.bit.I1MUX);
+}
+
+// Get the IDAC2 mux configuration
+uint8_t getIDAC2mux(void)
+{
+	ADS122C04_readReg(ADS122C04_CONFIG_3_REG, &ADS122C04_Reg.reg3.all);
+	return(ADS122C04_Reg.reg3.bit.I2MUX);
+}
+
+
+void mem_write(unsigned int addr,long int val)
+{
+	unsigned int r;
+	unsigned int s;
+	r=val/10000;    //separate out 16bit data for loading
+	s=val%10000;// divide by 256 to make 8 bit data//
+	eeprom_write_byte((uint8_t*)(1*addr),r); //save on 1st(0x00) loc.of mem
+	while(!eeprom_is_ready());
+	r=s/256;
+	addr=addr+1;
+	eeprom_write_byte((uint8_t*)(1*addr),r);
+	while(!eeprom_is_ready());
+	r=s%256;
+	addr=addr+1;
+	eeprom_write_byte((uint8_t*)(1*addr),r);
+	while(!eeprom_is_ready());
+}
+
+long int mem_read( uint8_t addr)
+{
+	long int o,l;
+	unsigned int m,n;
+	l=eeprom_read_byte((uint8_t*)(1*addr));
+	asm("nop");
+	addr=addr+1;
+	m=eeprom_read_byte((uint8_t*)(1*addr));
+	asm("nop");
+	addr=addr+1;
+	n=eeprom_read_byte((uint8_t*)(1*addr));
+	_delay_ms(30);//20
+	o=l*10000+m*256+n;// mul by 256 to recover data
+	return (o);
+}
+
+
+void USART1_sendChar(char c)
+{
+	while (!(USART1.STATUS & USART_DREIF_bm))
+	{
+		;
+	}
+	USART1.TXDATAL = c;
+}
+void USART_1_enable()
+{
+	USART1.CTRLB |= USART_RXEN_bm | USART_TXEN_bm;
+}
+void USART_1_disable()
+{
+	USART1.CTRLB &= ~(USART_RXEN_bm | USART_TXEN_bm);
+}
+uint8_t USART_1_get_data()
+{
+	return USART1.RXDATAL;
+}
+
+uint8_t USART1_read()
+{
+	while (!(USART1.STATUS & USART_RXCIF_bm))
+	{
+		;
+	}
+	return USART1.RXDATAL;
+}
+
+
+void chk()
+{
+	long int a,b,c;
+	unsigned int i,d,e,f,g,addr;
+	char sign;
+	i=0;
+	
+	if(company[1]=='R' && company[2]=='F' && rxcntr==12 )// *RF1200.000# 7 digit
+	{
+		
+		a=(company[3]-0x30);
+		a=a*1000000;
+		b=(company[4]-0x30);
+		b=b*100000;
+		c=(company[5]-0x30);
+		c=c*10000;
+		d=(company[6]-0x30);
+		d=d*1000;
+		e=(company[8]-0x30);
+		e=e*100;
+		f= (company[9]-0x30)*1;
+		f=f*10;
+		g= (company[10]-0x30)*1;
+		
+		Reference_Set_Value=a+b+c+d+e+f+g;
+		
+		 mem_write((220),Reference_Set_Value);
+		
+		USART1_sendChar('O');
+		USART1_sendChar('K');
+		USART1_sendChar(0x0D);
+		strt=0;
+		rxcntr=0;
+		
+	}
+	
+
+	if(company[1]=='T' && rxcntr==10)
+	{
+		a=(company[2]-0x30);
+		a=a*1000;
+		b=(company[3]-0x30);
+		b=b*100;
+		c=(company[4]-0x30);
+		c=c*10;
+		d=(company[5]-0x30);
+		d=d*1;
+		limit=a+b+c+d;
+		
+		a=(company[7]-0x30);
+		a=a*10;
+		b=(company[8]-0x30);
+		b=b*1;
+		offset_value=a+b;
+		
+		mem_write(6,limit);
+		mem_write(150,offset_value);
+		
+		USART1_sendChar('O');
+		USART1_sendChar('K');
+		USART1_sendChar(0x0D);
+		strt=0;
+		rxcntr=0;
+	}
+	
+}
+
+void update_1()
+{
+		if(rxdata=='*')
+		{
+			strt=1;
+			rxcntr=0;
+		}
+		if(strt==1)
+		{
+			company[rxcntr]=rxdata;
+			rxcntr=rxcntr+1;
+			if(rxdata=='#')
+			{
+				chk();
+			}
+		}
+		
+}
+
+ISR(USART1_RXC_vect)
+{
+	rxdata=USART1.RXDATAL;
+	
+	update_1();
+
+}
+
+
+void USART1_init()
+{
+	PORTA.DIR &= ~PIN2_bm;//rxd
+	PORTA.DIR |= PIN1_bm;// txd
+	USART1.BAUD = (uint16_t)USART1_BAUD_RATE(9600); // set baud rate register
+
+	USART1.CTRLA = 0 << USART_ABEIE_bp    // Auto-baud Error Interrupt Enable: disabled
+	| 0 << USART_DREIE_bp  // Data Register Empty Interrupt Enable: disabled
+	| 0 << USART_LBME_bp   // Loop-back Mode Enable: disabled
+	| 1 << USART_RS485_bp    // RS485 Mode enabled //
+	| 1 << USART_RXCIE_bp  // Receive Complete Interrupt Enable: enabled /
+	| 0 << USART_RXSIE_bp  //Receiver Start Frame Interrupt Enable: disabled /
+	| 0 << USART_TXCIE_bp; //Transmit Complete Interrupt Enable: disabled /
+	
+	USART1.CTRLB |= USART_RXEN_bm | USART_TXEN_bm;
+}
+
+
+/* home_online_tx: prints all output columns.
+   Format: <LF> str2  str3  TTTT  D:d  PGABYP:p  G:g <CR>  */
+void home_online_tx(uint32_t elapsed_ms, uint8_t dr, uint8_t pga, uint8_t gain)
+{
+	unsigned char i;
+	USART1_sendChar(0x0A);// new line
+
+    for(i=0;i<8;i++)
+    {
+	    USART1_sendChar(str2[i]); //Raw ADC
+    }
+    
+    USART1_sendChar(' ');
+    USART1_sendChar(' '); 
+	
+	for(i=0;i<9;i++)
+	{
+		USART1_sendChar(str3[i]); // actual sensor output after minus with reference voltage
+	}
+	
+	USART1_sendChar(' ');
+	USART1_sendChar(' ');
+
+	/* ADDED: elapsed time column — 4 digits, milliseconds */
+	USART1_sendChar((elapsed_ms / 1000) % 10 + '0');
+	USART1_sendChar((elapsed_ms / 100)  % 10 + '0');
+	USART1_sendChar((elapsed_ms / 10)   % 10 + '0');
+	USART1_sendChar((elapsed_ms)        % 10 + '0');
+
+	USART1_sendChar(' ');
+	USART1_sendChar(' ');
+
+	USART1_sendChar('D');
+	USART1_sendChar(':');
+	USART1_sendChar(dr + '0');
+	USART1_sendChar(' ');
+	USART1_sendChar(' ');
+
+	/* PGABYP: 1=PGA bypassed/disabled, 0=PGA active */
+	USART1_sendChar('P');
+	USART1_sendChar('G');
+	USART1_sendChar('A');
+	USART1_sendChar('B');
+	USART1_sendChar('Y');
+	USART1_sendChar('P');
+	USART1_sendChar(':');
+	USART1_sendChar(pga + '0');
+	USART1_sendChar(' ');
+	USART1_sendChar(' ');
+
+	/* G: gain register value 0=x1, 1=x2, 2=x4 ... 7=x128 */
+	USART1_sendChar('G');
+	USART1_sendChar(':');
+	USART1_sendChar(gain + '0');
+	USART1_sendChar(' ');
+	USART1_sendChar(' ');
+
+	USART1_sendChar(0x0D);
+}
+
+
+// readRawVoltage — NOT USED in this firmware.
+// Actual measurement is done by read_sensor() which calls poll_and_read().
+// This function is retained for reference only.
+int32_t readRawVoltage(uint8_t rate)
+{
+	raw_voltage_union raw_v; // union to convert uint32_t to int32_t
+
+	bool drdy = false; // DRDY (1 == new data is ready)
+	// Start the conversion (assumes we are using single shot mode)
+	start();
+
+	
+	do 
+	{
+		_delay_ms(10); // Don't pound the bus too hard
+		drdy = checkDataReady();
+	} while ((drdy == false));
+
+	// Check if we timed out
+	if (drdy == false)
+	{
+		return(0);
+	}
+
+	// Read the conversion result
+	if(ADS122C04_getConversionData(&raw_v.UINT32) == false)
+	{
+		return(0);
+	}
+
+	if ((raw_v.UINT32 & 0x00800000) == 0x00800000)
+	raw_v.UINT32 |= 0xFF000000;
+	return(raw_v.INT32);
+}
+
+void filter_raw_sensor()
+{
+	if(sensor_final_output>=pub_adc_value)
+	{
+		diff_adc_value=sensor_final_output-pub_adc_value;
+		
+		if(diff_adc_value>limit)
+		{
+			pub_adc_value=sensor_final_output;
+			
+		}
+		else
+		{
+			sensor_final_output=pub_adc_value;
+			
+		}
+		
+	}
+	else
+	{
+		diff_adc_value=pub_adc_value-sensor_final_output;
+		
+		if(diff_adc_value>limit)
+		{
+			pub_adc_value=sensor_final_output;
+			
+		}
+		else
+		{
+			sensor_final_output=pub_adc_value;
+			
+		}
+		
+	}
+}
+
+
+/* Poll DRDY with 1 ms spacing and read ADC. Returns 0 on timeout. */
+uint32_t poll_and_read(void)
+{
+	bool drdy = 0;
+	{ uint32_t t = millis_count;
+	  do {
+		drdy = checkDataReady();
+		if (drdy == 0) { uint32_t w=millis_count; while((millis_count-w)<1){} }
+	  } while ((drdy == 0) && ((millis_count - t) < drdy_timeout_ms)); }
+	if (!drdy) { return 0; }
+	uint32_t raw = readADC();
+	if (raw >= 0x800000) { raw = 0; }
+	return raw;
+}
+
+/* set_inter_sample_delay: call once after setDataRate() before run_mode().
+   4x conversion period settle + 6x timeout for all 7 supported rates.  */
+void set_inter_sample_delay(uint8_t dr)
+{
+	/* SPS:    20   45   90  175  330  600  1000
+	   4x ms: 200   89   44   23   13    7     4
+	   6x ms: 300  134   67   34   19   10     6  */
+	/* Single-shot mode for all rates. Settle = 6x conversion period
+	   for 330/600/1000 SPS to give solid margin against millis_count
+	   1ms tick jitter. 4x used for 20-175 SPS (verified working).
+	   SPS:   20   45   90  175  330  600  1000
+	   4x:   200   89   44   23    -    -     -  ms
+	   6x:     -    -    -    -   18   10     6  ms
+	   timeout = 2x settle                        */
+	switch(dr)
+	{
+		case ADS122C04_DATA_RATE_20SPS:
+			inter_sample_delay_ms=200; drdy_timeout_ms=400; break;
+		case ADS122C04_DATA_RATE_45SPS:
+			inter_sample_delay_ms=89;  drdy_timeout_ms=178; break;
+		case ADS122C04_DATA_RATE_90SPS:
+			inter_sample_delay_ms=44;  drdy_timeout_ms=88;  break;
+		case ADS122C04_DATA_RATE_175SPS:
+			inter_sample_delay_ms=23;  drdy_timeout_ms=46;  break;
+		case ADS122C04_DATA_RATE_330SPS:
+			inter_sample_delay_ms=18;  drdy_timeout_ms=36;  break;
+		case ADS122C04_DATA_RATE_600SPS:
+			inter_sample_delay_ms=10;  drdy_timeout_ms=20;  break;
+		case ADS122C04_DATA_RATE_1000SPS:
+			inter_sample_delay_ms=6;   drdy_timeout_ms=12;  break;
+		default:
+			inter_sample_delay_ms=200; drdy_timeout_ms=400; break;
+	}
+}
+
+void read_sensor()
+{
+	long long adc_data,adc_avg;
+	unsigned int i;
+
+		 adc_data=0;
+		 adc_avg=0;
+
+		 /* Dummy conversion to flush sinc3 filter pipeline.
+		    After any config change the first result is corrupted.
+		    Discard it, then collect 4 clean samples.             */
+		 start();
+		 poll_and_read();
+		 { uint32_t t=millis_count; while((millis_count-t)<inter_sample_delay_ms){} }
+
+		 /* 4 real samples */
+		 for(i=0;i<4;i++)
+		 {
+			 start();
+			 uint32_t raw = poll_and_read();
+			 float volts = ((float)raw) / 4096;
+			 adc_data=volts*1000;
+			 adc_avg+=adc_data;
+			 { uint32_t t=millis_count; while((millis_count-t)<inter_sample_delay_ms){} }
+		 }
+		 
+		 adc_data=adc_avg/4;
+		 
+		 sensor_final_output=adc_data;
+		 
+		 if(sensor_final_output>2047999)//2047999
+		 {
+			 sensor_final_output=2047999;
+		 }
+		 
+				 
+		 filter_raw_sensor();
+			 
+		  str2[0]=(sensor_final_output/1000000)+0x30;
+		  str2[1]=((sensor_final_output%1000000)/100000)+0x30;
+		  str2[2]=(((sensor_final_output%1000000)%100000)/10000)+0x30;
+		  str2[3]=((((sensor_final_output%1000000)%100000)%10000)/1000)+0x30;
+		  str2[4]='.';
+		  str2[5]=(((((sensor_final_output%1000000)%100000)%10000)%1000)/100)+0x30;
+		  str2[6]=((((((sensor_final_output%1000000)%100000)%10000)%1000)%100)/10)+0x30;
+		  str2[7]=(((((((sensor_final_output%1000000)%100000)%10000)%1000)%100)%10)/1)+0x30;
+		 
+		 sensor_final_output=sensor_final_output-Reference_Set_Value;
+				 
+		 if(sensor_final_output>=0)
+		 {
+			 str3[0]='+';
+			 str3[1]=(sensor_final_output/1000000)+0x30;
+			 str3[2]=((sensor_final_output%1000000)/100000)+0x30;
+			 str3[3]=(((sensor_final_output%1000000)%100000)/10000)+0x30;
+			 str3[4]=((((sensor_final_output%1000000)%100000)%10000)/1000)+0x30;
+			 str3[5]='.';
+			 str3[6]=(((((sensor_final_output%1000000)%100000)%10000)%1000)/100)+0x30;
+			 str3[7]=((((((sensor_final_output%1000000)%100000)%10000)%1000)%100)/10)+0x30;
+			 str3[8]=((((((sensor_final_output%1000000)%100000)%10000)%1000)%100)%10)+0x30;
+			 
+		 }
+		else
+		{
+			sensor_final_output=(sensor_final_output)*(-1);
+			str3[0]='-';
+			str3[1]=(sensor_final_output/1000000)+0x30;
+			str3[2]=((sensor_final_output%1000000)/100000)+0x30;
+			str3[3]=(((sensor_final_output%1000000)%100000)/10000)+0x30;
+			str3[4]=((((sensor_final_output%1000000)%100000)%10000)/1000)+0x30;
+			str3[5]='.';
+			str3[6]=(((((sensor_final_output%1000000)%100000)%10000)%1000)/100)+0x30;
+			str3[7]=((((((sensor_final_output%1000000)%100000)%10000)%1000)%100)/10)+0x30;
+			str3[8]=((((((sensor_final_output%1000000)%100000)%10000)%1000)%100)%10)+0x30;
+			sensor_final_output=(sensor_final_output)*(-1);
+		}
+}
+
+void timer_init()
+{
+	TCA0.SINGLE.CTRLA   = TCA_SINGLE_CLKSEL_DIV64_gc;  // prescaler /64
+	TCA0.SINGLE.PER     = 52;                           // ~1 ms at 3.333 MHz / 64
+	TCA0.SINGLE.INTCTRL = TCA_SINGLE_OVF_bm;
+	TCA0.SINGLE.CTRLA  |= TCA_SINGLE_ENABLE_bm;
+}
+
+/* ── ADDED: TCA0 overflow ISR — increments millis_count every ~1 ms ── */
+ISR(TCA0_OVF_vect)
+{
+	millis_count++;
+	TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm;
+}
+
+
+void run_mode()
+{
+	unsigned int sd_tx,txcounter,first_time,k;
+	upflag=0;
+	overrange=0;
+	first_time=0;
+	unsigned int addr;
+	offset_value=mem_read(150);
+	if(offset_value>100)
+	{
+		offset_value=30;
+	}
+	txcounter=0;
+
+	while(1)
+	{
+		/* ADDED: snapshot millis before read_sensor, compute elapsed after */
+		uint32_t start_time = millis_count;
+
+		read_sensor();
+
+		uint32_t elapsed = millis_count - start_time;
+
+		home_online_tx(elapsed, diag_dr, diag_pga, diag_gain);
+	}
+}
+
+
+int main(void)
+{
+	unsigned int addr;
+	long int loc_data;
+	unsigned char i;
+		
+		PORTA_DIR=0xFF;
+		PORTA_OUTSET = ADC_RESET;
+		PORTB_DIR=0xFF;
+		_delay_ms(500);
+		InitI2C();
+		USART1_init();
+		_delay_ms(100);
+
+		/* ADDED: start timer before sei() so millis_count is running */
+		timer_init();
+		sei();
+		
+			limit=mem_read(6);
+			_delay_ms(20);
+			
+			addr=160;
+			i=eeprom_read_byte((uint8_t*)(1*addr));
+			asm("nop");
+								
+			Reference_Set_Value=mem_read(220);
+			if(Reference_Set_Value>2000000)
+			{
+				Reference_Set_Value=0;
+			}
+		
+			USART1_sendChar('M');
+			USART1_sendChar('N');
+			USART1_sendChar('S');
+			USART1_sendChar('T');
+			USART1_sendChar(0x0D);
+			USART1_sendChar(0x0A);
+
+		 setInputMultiplexer(ADS122C04_MUX_AIN1_AIN0); // Route AIN1 and AIN0 to AINP and AINN
+		 setGain(ADS122C04_GAIN_1); // Set the gain to 1
+		 enablePGA(ADS122C04_PGA_DISABLED); // Disable the Programmable Gain Amplifier
+		 setDataRate(ADS122C04_DATA_RATE_175SPS); // <-- change SPS here
+		 setOperatingMode(ADS122C04_OP_MODE_NORMAL); // Disable turbo mode
+		 setConversionMode(ADS122C04_CONVERSION_MODE_SINGLE_SHOT); // Use single shot mode
+		 setVoltageReference(ADS122C04_VREF_INTERNAL); // Use the internal 2.048V reference
+		 enableInternalTempSensor(ADS122C04_TEMP_SENSOR_OFF); // Disable the temperature sensor
+		 setDataCounter(ADS122C04_DCNT_DISABLE); // Disable the data counter
+		 setDataIntegrityCheck(ADS122C04_CRC_DISABLED); // Disable CRC checking
+		 setBurnOutCurrent(ADS122C04_BURN_OUT_CURRENT_OFF); // Disable the burn-out current
+		 setIDACcurrent(ADS122C04_IDAC_CURRENT_OFF); // Disable the IDAC current
+		 setIDAC1mux(ADS122C04_IDAC1_DISABLED); // Disable IDAC1
+		 setIDAC2mux(ADS122C04_IDAC2_DISABLED); // Disable IDAC2
+
+		 
+		 diag_dr   = ADS122C04_Reg.reg1.bit.DR;
+		 diag_pga  = ADS122C04_Reg.reg0.bit.PGA_BYPASS;
+		 diag_gain = ADS122C04_Reg.reg0.bit.GAIN;
+		 set_inter_sample_delay(diag_dr);
+
+		 reset();
+		 _delay_ms(2);
+		 setDataRate(ADS122C04_Reg.reg1.bit.DR);
+
+		 {
+			 uint8_t reg1_readback = 0;
+			 ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &reg1_readback);
+			 uint8_t actual_dr = (reg1_readback >> 5) & 0x07;
+			 USART1_sendChar('C');
+			 USART1_sendChar('H');
+			 USART1_sendChar('K');
+			 USART1_sendChar(':');
+			 USART1_sendChar('D');
+			 USART1_sendChar('R');
+			 USART1_sendChar('=');
+			 USART1_sendChar(actual_dr + '0');
+			 USART1_sendChar(' ');
+			 USART1_sendChar('R');
+			 USART1_sendChar('E');
+			 USART1_sendChar('G');
+			 USART1_sendChar('1');
+			 USART1_sendChar('=');
+			 /* print reg1 as 8 binary digits */
+			 for (int8_t b=7; b>=0; b--) {
+				 USART1_sendChar(((reg1_readback >> b) & 1) + '0');
+			 }
+			 USART1_sendChar(0x0D);
+			 USART1_sendChar(0x0A);
+			 /* Update diag_dr with ACTUAL chip value, not struct value */
+			 diag_dr = actual_dr;
+			 set_inter_sample_delay(diag_dr);
+		 }
+
+		 run_mode();
+   
+}
