@@ -1,0 +1,1721 @@
+"""
+T5 Sensor Simulator — V2.9.3
+
+Bug-fix & Logic update release over V2.9.2
+
+═══════════════════════════════════════════════════════════════
+[V2.9.3 LOGIC UPDATE] "READY" MESSAGE MOVED TO AIR / BASELINE:
+    ROOT CAUSE: Previously, the "READY: LOW/LARGE LEAKS" status 
+    was flashed inside the RECOVERING (-3) state box. 
+    
+    FIX: 
+    1. RECOVERING state now *only* shows the recovery percentage.
+    2. The ready message has been moved exclusively to the 
+       AIR / BASELINE (-1) state.
+    3. Displays "READY: LARGE LEAKS" once the Leaky C achieves the 
+       daughter baseline (triggering the AIR state).
+    4. Automatically upgrades to "READY: LOW LEAKS" once the 
+       daughter baseline stabilizes and matches the mother baseline.
+═══════════════════════════════════════════════════════════════
+"""
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.ticker as ticker
+import os, re, threading, time, queue, json
+from datetime import datetime
+
+# ── PERSISTENT MEMORY FILE PATH ───────────────────────────────────────────────
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_MEMORY_FILE  = os.path.join(_SCRIPT_DIR, 'T5_memory.json')
+
+def _load_memory():
+    try:
+        if os.path.exists(_MEMORY_FILE):
+            with open(_MEMORY_FILE, 'r') as f:
+                data = json.load(f)
+            return data
+    except Exception:
+        pass
+    return {}
+
+def _save_memory(mother_baseline):
+    try:
+        data = {
+            'mother_baseline': float(mother_baseline),
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        with open(_MEMORY_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as ex:
+        print(f'[T5] Memory save error: {ex}')
+        return False
+
+# ── LIGHT THEME COLOURS ───────────────────────────────────────────────────────
+BG   = '#f4f6fb'
+PNL  = '#ffffff'
+PNL2 = '#eef1f8'
+ACC  = '#2563eb'
+FG   = '#1e293b'
+DIM  = '#64748b'
+BRD  = '#cbd5e1'
+SEP  = '#e2e8f0'
+
+C_AIR  = '#059669'
+C_UP   = '#d97706'
+C_DN   = '#dc2626'
+C_REC  = '#7c3aed'
+C_RAW  = '#3b82f6'
+C_LEA  = '#10b981'
+C_BAS  = '#ef4444'
+C_CONC = '#db2777'
+C_OR   = '#dc2626'
+C_STB  = '#16a34a'
+C_MOTHER = '#f59e0b'
+
+BASELINE_WARMUP_SAMPLES = 400
+KEEP_WINDOW             = 8000
+LIVE_MAX_SAMPLES        = 120000
+
+MIN_MV_SPAN  = 5.0
+MIN_PPM_SPAN = 20.0
+
+DEFAULT_PARAMS = {
+    'jmp'     : 0.1,
+    'alp'     : 0.1,
+    'upG'     : 6.0,
+    'inG'     : 0.1,
+    'dnG'     : 6.0,
+    'dnI'     : -0.1,
+    'rec'     : 0.8,
+    'drf'     : 20.0,
+    'n_thresh': 0.0033,
+    'o_cap'   : 80,
+    'ramp_up' : [(-100, 0.0001), (40, 0.1), (200, 0.1), (400, 0.1)],
+    'ramp_dn' : [(-100, -1e-5),  (40, -0.1), (200, -0.2), (400, -1.0)],
+    'stab_rec': [(0, 1), (1e-5, 1), (0.001, 1), (0.01, 0.9),
+                 (0.1, 0.85), (0.25, 0.67), (0.5, 0.5), (0.8, 0.25)],
+    'calib'   : [(0.0, 0), (0.12, 5), (0.30, 10), (4.2, 100),
+                 (60.0, 1000), (260.0, 5000), (368.0, 10000),
+                 (430.0, 20000), (720.0, 100000)],
+    'rec_zero_pct'       : 0.05,
+    'warmup_samples'     : BASELINE_WARMUP_SAMPLES,
+    'or_thresh'          : 720.0,
+    'or_exit_mv'         : 20.0,
+    'or_sd_stable'       : 0.000020,
+    'daughter_mother_prox': 2.0,
+}
+
+
+# ── VLOOKUP HELPERS ───────────────────────────────────────────────────────────
+def vlu(v, tbl):
+    r = tbl[0][1]
+    for k, val in tbl:
+        if v >= k: r = val
+        else: break
+    return r
+
+def vlu_sd(v, tbl):
+    r = tbl[0][1]
+    for k, val in tbl:
+        if v >= k: r = val
+    return r
+
+def calib_interp(p_val, tbl):
+    if p_val <= tbl[0][0]:  return float(tbl[0][1])
+    if p_val >= tbl[-1][0]: return float(tbl[-1][1])
+    for i in range(len(tbl) - 1):
+        x0, y0 = tbl[i]; x1, y1 = tbl[i + 1]
+        if x0 <= p_val <= x1:
+            t = (p_val - x0) / (x1 - x0)
+            return round(y0 + t * (y1 - y0))
+    return float(tbl[-1][1])
+
+
+# ── LOG PARSER ────────────────────────────────────────────────────────────────
+_LOG_RE = re.compile(r'^\s*[+-]?\d+(?:\.\d+)?[\s\t]+([+-]?\d+(?:\.\d+)?)')
+
+def parse_log_emf(line):
+    line = line.strip().replace('\r', '').replace('\x00', '')
+    m = _LOG_RE.match(line)
+    if m:
+        try: return float(m.group(1))
+        except: pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BATCH COMPUTE
+# ═══════════════════════════════════════════════════════════════════════════════
+def compute_all(emf, p, seed_baseline=None):
+    n = len(emf)
+    warmup = int(p.get('warmup_samples', BASELINE_WARMUP_SAMPLES))
+    prox_mv = float(p.get('daughter_mother_prox', 2.0))
+
+    C  = np.empty(n);      II = np.empty(n, float)
+    J  = np.empty(n);      K  = np.empty(n)
+    L  = np.empty(n);      MB = np.empty(n)
+    M  = np.empty(n)
+    D  = np.zeros(n, int); E  = np.zeros(n)
+    FF = np.zeros(n, int); G  = np.zeros(n)
+    H  = np.zeros(n)
+    N_ = np.zeros(n);      O_ = np.zeros(n, int)
+    Pv = np.zeros(n);      Q_ = np.zeros(n)
+    RC = np.zeros(n)
+    OR_STATE = np.empty(n, dtype=object)
+
+    jmp=p['jmp']; alp=p['alp']; upG=p['upG']; inG=p['inG']
+    dnG=p['dnG']; dnI=p['dnI']; rec=p['rec']; drf=p['drf']
+    nth=p['n_thresh']; ocap=int(p['o_cap'])
+    ru=p['ramp_up']; rd=p['ramp_dn']; sr=p['stab_rec']; cb=p['calib']
+    rzp=p.get('rec_zero_pct', 0.05)
+    or_thr  = float(p.get('or_thresh',   720.0))
+    or_exit = float(p.get('or_exit_mv',   20.0))
+    or_sd   = float(p.get('or_sd_stable', 0.000020))
+
+    if seed_baseline is not None:
+        daughter_baseline = float(seed_baseline)
+        mother_baseline   = float(seed_baseline)
+        baseline_seeded   = True
+    else:
+        daughter_baseline = 0.0
+        mother_baseline   = 0.0
+        baseline_seeded   = False
+
+    C[0]  = emf[0]; II[0] = -1.0; K[0] = 0.0; J[0] = 0.0
+    if baseline_seeded:
+        L[0]  = daughter_baseline
+        MB[0] = mother_baseline
+    else:
+        L[0]  = emf[0]; MB[0] = emf[0]
+    M[0]  = emf[0] - L[0]; OR_STATE[0] = 'normal'
+    peak_m = 0.0; or_state = 'normal'
+
+    for i in range(1, n):
+        e  = emf[i]; cp = C[i-1]
+        C[i] = e if abs(e - cp) > jmp else (e - cp) * alp + cp
+
+        if or_state == 'normal':
+            if e > or_thr: or_state = 'overrange'
+        elif or_state == 'overrange':
+            if e < or_exit: or_state = 'waiting_drop'
+        elif or_state == 'waiting_drop':
+            if e > or_thr: or_state = 'overrange'
+            else:
+                sd_win = float(np.std(C[max(0, i-5):i+1]))
+                if sd_win < or_sd and e < or_exit: or_state = 'stable'
+        elif or_state == 'stable':
+            if e > or_thr: or_state = 'overrange'
+        OR_STATE[i] = or_state
+        in_or = (or_state in ('overrange', 'waiting_drop', 'stable'))
+
+        if i == warmup and not baseline_seeded:
+            initial_val     = float(np.mean(C[0:warmup]))
+            daughter_baseline = initial_val
+            mother_baseline   = initial_val
+            L[i-1]  = daughter_baseline
+            MB[i-1] = mother_baseline
+            baseline_seeded = True
+
+        in_warmup = (i < warmup) and not baseline_seeded
+
+        if in_or or i < 7:
+            II[i] = II[i-1]; D[i]=0; E[i]=0; FF[i]=0; G[i]=0; H[i]=0
+            sl = C[max(0, i-5):i+1]; J[i] = float(np.std(sl))
+            K[i]=0.0; L[i]=L[i-1]; MB[i]=MB[i-1]; M[i]=C[i]-L[i]
+            N_[i]=0.0; O_[i]=0; Pv[i]=0.0; Q_[i]=0.0; RC[i]=100.0
+            continue
+
+        c=C[i]; c6=C[i-6]; cp1=C[i-1]
+        D[i]  = D[i-1]+1  if (c-cp1) > vlu(c,ru) else 0
+        E[i]  = E[i-1]+(c-c6) if D[i]>0 else 0
+        FF[i] = FF[i-1]+1 if (c-c6) < vlu(c,rd) else 0
+        G[i]  = G[i-1]+(c-c6) if FF[i]>0 else 0
+        h = (1 if D[i]>upG and E[i]>inG else 0)+(-1 if FF[i]>dnG and G[i]<dnI else 0)
+        H[i]=h; II[i] = II[i-1] if h==0 else float(h)
+        sl=C[i-5:i+1]; J[i]=float(np.std(sl))
+        K[i] = 0.0 if (in_warmup or II[i]==1.0) else vlu_sd(J[i],sr)
+
+        if in_warmup:
+            l=L[i-1]; mb=MB[i-1]
+        else:
+            c_now=C[i]
+            if c_now < mother_baseline:
+                mother_baseline=c_now; l=c_now
+            else:
+                if K[i]>=rec and abs(c_now-mother_baseline)<drf: l=c_now
+                else: l=L[i-1]
+            mb=mother_baseline
+            if abs(l-mother_baseline)<=prox_mv:
+                mother_baseline=l; mb=mother_baseline
+
+        daughter_baseline=l; L[i]=l; MB[i]=mb; M[i]=C[i]-L[i]
+
+        prev_ii=II[i-1]
+        if II[i]==-1.0 and prev_ii==1.0: peak_m=abs(M[i-1])
+        if II[i]==1.0 and prev_ii==-1.0: N_[i]=M[i]
+        elif II[i]==1.0:
+            delta=M[i]-M[i-1]
+            N_[i]=N_[i-1]+delta if (M[i]>0 and delta>nth*M[i]) else N_[i-1]
+        else: N_[i]=0.0
+
+        if II[i]>0: O_[i]=ocap if O_[i-1]==ocap else O_[i-1]+1
+        else: O_[i]=0
+        if O_[i]==O_[i-1]: Pv[i]=Pv[i-1]
+        elif O_[i]==ocap:   Pv[i]=N_[i]
+        else:               Pv[i]=0.0
+        q_src=Pv[i] if O_[i]>=ocap else N_[i]
+        Q_[i]=calib_interp(q_src,cb)
+
+        if II[i]==-1.0 and peak_m>0:
+            abs_m=abs(M[i])
+            RC[i]=100.0 if abs_m<rzp*peak_m else max(0.0,min(99.9,(1.0-abs_m/peak_m)*100.0))
+        elif II[i]==1.0: RC[i]=0.0
+        else:            RC[i]=RC[i-1]
+
+    return C, D, E, FF, G, H, II, J, K, L, MB, M, N_, O_, Pv, Q_, RC, OR_STATE
+
+
+def load_csv(path):
+    with open(path, 'rb') as f: raw = f.read()
+    txt   = raw.decode('utf-8', errors='replace').replace('\ufeff','').replace('\r','')
+    lines = txt.strip().split('\n')
+    hdr   = [h.strip().lower().replace('"','').replace("'",'') for h in lines[0].split(',')]
+    if 'time_sec' not in hdr or 'emf_mv' not in hdr:
+        raise ValueError(f"Need time_sec & emf_mv columns.\nFound: {hdr}")
+    ti=hdr.index('time_sec'); ei=hdr.index('emf_mv')
+    rows=[]
+    for ln in lines[1:]:
+        ln=ln.strip()
+        if not ln: continue
+        parts=[v.strip().strip('"').strip("'") for v in ln.split(',')]
+        try: rows.append((float(parts[ti]),float(parts[ei])))
+        except: pass
+    if not rows: raise ValueError("No valid data rows found.")
+    return rows
+
+
+# ── LIVE STATE ────────────────────────────────────────────────────────────────
+class LiveState:
+    MAX = LIVE_MAX_SAMPLES
+    def __init__(self):
+        self._lock=threading.Lock(); self._emf=[]; self._new=0; self._stop=False
+    def push(self,v):
+        with self._lock:
+            if len(self._emf)>=self.MAX: self._emf.pop(0)
+            self._emf.append(v); self._new+=1
+    def consume(self):
+        with self._lock: n=self._new; self._new=0; return list(self._emf),n
+    def stop(self):
+        with self._lock: self._stop=True
+    def should_stop(self):
+        with self._lock: return self._stop
+    def reset(self):
+        with self._lock: self._emf=[]; self._new=0; self._stop=False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INCREMENTAL COMPUTE
+# ═══════════════════════════════════════════════════════════════════════════════
+class IncrementalCompute:
+    PRUNE_EVERY = 1000
+    KEEP_FULL   = 200
+
+    def __init__(self, p):
+        self.p=p; self.i=0; self._peak_m=0.0
+        self._baseline_seeded=False
+        self._daughter_baseline=0.0
+        self._mother_baseline=0.0
+        self.emf=[]; self.C=[]; self.II=[]
+        self.D=[]; self.E=[]; self.FF=[]; self.G=[]
+        self.H=[]; self.J=[]; self.K=[]
+        self.L=[]; self.MB=[]
+        self.M=[]; self.N=[]; self.O=[]; self.P=[]; self.Q=[]; self.REC=[]
+        self.OR_STATE=[]
+        self._disp_offset=0; self._ppm_locked=False; self._locked_ppm=0.0
+        self._or_state='normal'
+
+    def do_calibrate(self):
+        if not self.C: return False
+        new_base=self.C[-1]
+        self._daughter_baseline=new_base; self._mother_baseline=new_base
+        self._baseline_seeded=True; self._peak_m=0.0
+        self._ppm_locked=False; self._locked_ppm=0.0
+        if len(self.II)>0: self.II[-1]=-1.0
+        self._or_state='normal'
+        if self.L:  self.L[-1]=new_base
+        if self.MB: self.MB[-1]=new_base
+        if self.N:  self.N[-1]=0.0
+        if self.O:  self.O[-1]=0
+        if self.P:  self.P[-1]=0.0
+        if self.Q:  self.Q[-1]=0.0
+        self._disp_append(self.OR_STATE,'normal')
+        return True
+
+    def do_manual_tear(self):
+        if not self.C: return False
+        tear_val=self.C[-1]
+        self._mother_baseline=tear_val; self._daughter_baseline=tear_val
+        if self.L:  self.L[-1]=tear_val
+        if self.MB: self.MB[-1]=tear_val
+        self._peak_m=0.0; self._ppm_locked=False; self._locked_ppm=0.0
+        return True
+
+    def _prune(self):
+        keep=KEEP_WINDOW+self.KEEP_FULL
+        if len(self.emf)>keep*2:
+            trim=len(self.emf)-keep
+            self.emf=self.emf[trim:]; self.C=self.C[trim:]; self.II=self.II[trim:]
+
+    def _disp_append(self,lst,val):
+        lst.append(val)
+        if len(lst)>KEEP_WINDOW: lst.pop(0); self._disp_offset+=1
+
+    def step(self, emf_val):
+        p=self.p; i=self.i; self.emf.append(emf_val)
+        jmp=p['jmp']; alp=p['alp']; upG=p['upG']; inG=p['inG']
+        dnG=p['dnG']; dnI=p['dnI']; rec=p['rec']; drf=p['drf']
+        nth=p['n_thresh']; ocap=int(p['o_cap'])
+        rzp=p.get('rec_zero_pct',0.05)
+        warmup=int(p.get('warmup_samples',BASELINE_WARMUP_SAMPLES))
+        or_thr=float(p.get('or_thresh',720.0))
+        or_exit=float(p.get('or_exit_mv',20.0))
+        or_sd=float(p.get('or_sd_stable',0.000020))
+        prox_mv=float(p.get('daughter_mother_prox',2.0))
+
+        if i==0:
+            self.C.append(emf_val); self.II.append(-1.0)
+            init_l=self._daughter_baseline if self._baseline_seeded else emf_val
+            self._disp_append(self.K,0.0); self._disp_append(self.L,init_l)
+            self._disp_append(self.MB,init_l)
+            self._disp_append(self.M,emf_val-init_l); self._disp_append(self.J,0.0)
+            for lst in (self.D,self.E,self.FF,self.G,self.H,self.N,self.O):
+                self._disp_append(lst,0)
+            self._disp_append(self.P,0.0); self._disp_append(self.Q,0.0)
+            self._disp_append(self.REC,100.0)
+            self._disp_append(self.OR_STATE,self._or_state)
+            self.i+=1; return
+
+        cp=self.C[-1]
+        c=emf_val if abs(emf_val-cp)>jmp else (emf_val-cp)*alp+cp
+        self.C.append(c)
+
+        if self._or_state=='normal':
+            if emf_val>or_thr: self._or_state='overrange'
+        elif self._or_state=='overrange':
+            if emf_val<or_exit: self._or_state='waiting_drop'
+        elif self._or_state=='waiting_drop':
+            if emf_val>or_thr: self._or_state='overrange'
+            else:
+                def _cidx_sd(abs_i): return abs_i-(self.i-len(self.C)+1)
+                sl=self.C[max(0,_cidx_sd(i-5)):]
+                sd_now=float(np.std(sl)) if len(sl)>1 else 999.0
+                if sd_now<or_sd and emf_val<or_exit: self._or_state='stable'
+        elif self._or_state=='stable':
+            if emf_val>or_thr: self._or_state='overrange'
+
+        in_or=(self._or_state in ('overrange','waiting_drop','stable'))
+        self._disp_append(self.OR_STATE,self._or_state)
+
+        if i==warmup and not self._baseline_seeded:
+            seed=float(np.mean(self.C[:warmup]))
+            self._daughter_baseline=seed; self._mother_baseline=seed
+            self._baseline_seeded=True
+            if self.L:  self.L[-1]=seed
+            if self.MB: self.MB[-1]=seed
+
+        in_warmup=(i<warmup) and not self._baseline_seeded
+
+        if i<7 or in_or:
+            self.II.append(self.II[-1])
+            for lst in (self.D,self.E,self.FF,self.G,self.H,self.N,self.O):
+                self._disp_append(lst,0)
+            sl=self.C[max(0,i-5):]
+            j=float(np.std(sl)) if len(sl)>1 else 0.0
+            self._disp_append(self.J,j); self._disp_append(self.K,0.0)
+            self._disp_append(self.L,self.L[-1] if self.L else c)
+            self._disp_append(self.MB,self.MB[-1] if self.MB else c)
+            self._disp_append(self.M,c-(self.L[-1] if self.L else c))
+            self._disp_append(self.P,0.0); self._disp_append(self.Q,0.0)
+            self._disp_append(self.REC,100.0); self.i+=1; return
+
+        def cidx(abs_i): return abs_i-(self.i-len(self.C)+1)
+        c6=self.C[cidx(i-6)] if cidx(i-6)>=0 else self.C[0]
+        cp1=self.C[cidx(i-1)]
+        d=self.D[-1]+1 if (c-cp1)>vlu(c,p['ramp_up']) else 0
+        e=self.E[-1]+(c-c6) if d>0 else 0
+        ff=self.FF[-1]+1 if (c-c6)<vlu(c,p['ramp_dn']) else 0
+        g=self.G[-1]+(c-c6) if ff>0 else 0
+        h=(1 if d>upG and e>inG else 0)+(-1 if ff>dnG and g<dnI else 0)
+        prev_ii=self.II[-1]; ii=float(prev_ii) if h==0 else float(h)
+        self.II.append(ii)
+        sl=self.C[max(0,cidx(i-5)):]
+        j=float(np.std(sl))
+        k=0.0 if (in_warmup or ii==1.0) else vlu_sd(j,p['stab_rec'])
+
+        if in_warmup:
+            l=self.L[-1]; mb=self.MB[-1] if self.MB else l
+        else:
+            c_now=c
+            if c_now<self._mother_baseline:
+                self._mother_baseline=c_now; l=c_now
+            else:
+                if k>=rec and abs(c_now-self._mother_baseline)<drf: l=c_now
+                else: l=self.L[-1]
+            mb=self._mother_baseline
+            if abs(l-self._mother_baseline)<=prox_mv:
+                self._mother_baseline=l; mb=self._mother_baseline
+
+        self._daughter_baseline=l; m=c-l
+
+        if ii==1.0 and prev_ii==-1.0:
+            n_val=m; self._ppm_locked=False; self._locked_ppm=0.0
+        elif ii==1.0:
+            delta=m-self.M[-1]
+            n_val=self.N[-1]+delta if (m>0 and delta>nth*m) else self.N[-1]
+        else:
+            n_val=0.0; self._ppm_locked=False; self._locked_ppm=0.0
+
+        o_prev=self.O[-1]
+        o_val=(ocap if o_prev==ocap else o_prev+1) if ii>0 else 0
+        if o_val==o_prev: pv=self.P[-1]
+        elif o_val==ocap: pv=n_val
+        else:             pv=0.0
+
+        if o_val==ocap and o_prev<ocap:
+            self._ppm_locked=True; self._locked_ppm=calib_interp(pv,p['calib'])
+        if self._ppm_locked: q_val=self._locked_ppm
+        else:
+            q_src=pv if o_val>=ocap else n_val
+            q_val=calib_interp(q_src,p['calib'])
+
+        if ii==-1.0 and prev_ii==1.0: self._peak_m=abs(self.M[-1])
+        if ii==-1.0 and self._peak_m>0:
+            abs_m=abs(m)
+            rv=100.0 if abs_m<rzp*self._peak_m else max(0.0,min(99.9,(1.0-abs_m/self._peak_m)*100.0))
+        elif ii==1.0: rv=0.0
+        else:         rv=self.REC[-1]
+
+        self._disp_append(self.D,d); self._disp_append(self.E,e)
+        self._disp_append(self.FF,ff); self._disp_append(self.G,g)
+        self._disp_append(self.H,h); self._disp_append(self.J,j)
+        self._disp_append(self.K,k); self._disp_append(self.L,l)
+        self._disp_append(self.MB,mb); self._disp_append(self.M,m)
+        self._disp_append(self.N,n_val); self._disp_append(self.O,o_val)
+        self._disp_append(self.P,pv); self._disp_append(self.Q,q_val)
+        self._disp_append(self.REC,rv); self.i+=1
+        if self.i%self.PRUNE_EVERY==0: self._prune()
+
+    def last(self):
+        if not self.C: return None
+        return dict(
+            C=self.C[-1], D=self.D[-1] if self.D else 0,
+            E=self.E[-1] if self.E else 0, FF=self.FF[-1] if self.FF else 0,
+            G=self.G[-1] if self.G else 0, H=self.H[-1] if self.H else 0,
+            II=self.II[-1], J=self.J[-1] if self.J else 0,
+            M=self.M[-1] if self.M else 0, N=self.N[-1] if self.N else 0,
+            O=self.O[-1] if self.O else 0, P=self.P[-1] if self.P else 0,
+            Q=self.Q[-1] if self.Q else 0, REC=self.REC[-1] if self.REC else 100.0,
+            OR_STATE=self.OR_STATE[-1] if self.OR_STATE else 'normal',
+            mother_baseline=self.MB[-1] if self.MB else 0.0,
+            daughter_baseline=self.L[-1] if self.L else 0.0,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PARAMETER EDITOR
+# ═══════════════════════════════════════════════════════════════════════════════
+class EditWindow(tk.Toplevel):
+    def __init__(self, parent, params, on_apply):
+        super().__init__(parent)
+        self.title("Parameter Editor — V2.9.3")
+        self.configure(bg=BG); self.geometry("880x700"); self.resizable(True,True)
+        self.params=dict(params); self.on_apply=on_apply; self._vars={}
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+    def _build(self):
+        nb=ttk.Notebook(self); nb.pack(fill='both',expand=True,padx=6,pady=6)
+        sty=ttk.Style(); sty.theme_use('default')
+        sty.configure('TNotebook',background=BG,borderwidth=0)
+        sty.configure('TNotebook.Tab',background=PNL2,foreground=DIM,padding=[10,3],font=('Segoe UI',9))
+        sty.map('TNotebook.Tab',background=[('selected',PNL)],foreground=[('selected',ACC)])
+        for tab_fn,title in [
+            (self._core,'Core Logic'),(self._ramp,'Ramp/Drop Tables'),
+            (self._calib_tab,'Calibration (P→ppm)'),(self._stab,'Stability Recovery'),
+            (self._overrange,'Overrange'),
+        ]:
+            frm=tk.Frame(nb,bg=BG); nb.add(frm,text=title); tab_fn(frm)
+        btn=tk.Frame(self,bg=BG); btn.pack(fill='x',padx=6,pady=4)
+        tk.Button(btn,text='Apply & Close',bg=ACC,fg='#fff',font=('Segoe UI',10,'bold'),
+                  relief='flat',cursor='hand2',padx=10,pady=5,command=self._apply_close).pack(side='right',padx=3)
+        tk.Button(btn,text='Apply',bg=PNL2,fg=ACC,font=('Segoe UI',10),
+                  relief='flat',cursor='hand2',padx=10,pady=5,command=self._apply).pack(side='right',padx=3)
+        tk.Button(btn,text='Reset Defaults',bg=PNL2,fg=C_DN,font=('Segoe UI',10),
+                  relief='flat',cursor='hand2',padx=10,pady=5,command=self._reset_defaults).pack(side='left',padx=3)
+
+    def _row(self,p,r,label,key,tip=''):
+        tk.Label(p,text=label,bg=BG,fg=FG,font=('Segoe UI',9),anchor='w').grid(row=r,column=0,sticky='w',padx=8,pady=3)
+        sv=tk.StringVar(value=str(self.params.get(key,''))); self._vars[key]=sv
+        tk.Entry(p,textvariable=sv,bg=PNL,fg=ACC,font=('Segoe UI',10,'bold'),
+                 width=14,insertbackground=ACC,relief='solid',bd=1,
+                 highlightbackground=BRD,highlightthickness=1).grid(row=r,column=1,padx=8,pady=3,sticky='w')
+        if tip: tk.Label(p,text=tip,bg=BG,fg=DIM,font=('Segoe UI',7),anchor='w').grid(row=r,column=2,sticky='w',padx=4)
+
+    def _make_table(self,parent,title,key,c1,c2,scrollable=False):
+        hdr=tk.Frame(parent,bg=BG); hdr.pack(fill='x',padx=8,pady=(8,2))
+        tk.Label(hdr,text=title,bg=BG,fg=ACC,font=('Segoe UI',9,'bold')).pack(side='left')
+        add_btn=tk.Button(hdr,text='+ Row',bg=PNL2,fg=C_AIR,font=('Segoe UI',8),relief='flat',cursor='hand2',padx=6,pady=1)
+        add_btn.pack(side='right',padx=2)
+        colh=tk.Frame(parent,bg=BG); colh.pack(fill='x',padx=8)
+        tk.Label(colh,text=c1,bg=BG,fg=DIM,font=('Segoe UI',7,'bold'),width=16).pack(side='left')
+        tk.Label(colh,text=c2,bg=BG,fg=DIM,font=('Segoe UI',7,'bold'),width=16).pack(side='left')
+        if scrollable:
+            outer=tk.Frame(parent,bg=BG); outer.pack(fill='both',expand=True,padx=8)
+            canvas=tk.Canvas(outer,bg=BG,highlightthickness=0)
+            sb=ttk.Scrollbar(outer,orient='vertical',command=canvas.yview)
+            rf=tk.Frame(canvas,bg=BG)
+            rf.bind('<Configure>',lambda e:canvas.configure(scrollregion=canvas.bbox('all')))
+            canvas.create_window((0,0),window=rf,anchor='nw')
+            canvas.configure(yscrollcommand=sb.set)
+            canvas.pack(side='left',fill='both',expand=True); sb.pack(side='right',fill='y')
+        else:
+            rf=tk.Frame(parent,bg=BG); rf.pack(fill='x',padx=8)
+        pairs=[]
+
+        def add_row(kv='',vv=''):
+            rw=tk.Frame(rf,bg=BG); rw.pack(fill='x',pady=1)
+            sk=tk.StringVar(value=str(kv)); sv=tk.StringVar(value=str(vv))
+            tk.Entry(rw,textvariable=sk,bg=PNL,fg=FG,font=('Segoe UI',9),width=16,relief='solid',bd=1).pack(side='left',padx=2)
+            tk.Entry(rw,textvariable=sv,bg=PNL,fg=ACC,font=('Segoe UI',9),width=16,relief='solid',bd=1).pack(side='left',padx=2)
+            rem=tk.Button(rw,text='✕',bg=BG,fg=C_DN,font=('Segoe UI',7),relief='flat',cursor='hand2',padx=2,
+                         command=lambda r=rw,pair=(sk,sv):_remove_row(r,pair))
+            rem.pack(side='left',padx=1); pairs.append((sk,sv,rw))
+
+        def _remove_row(rw,pair):
+            if len(pairs)<=2: return
+            idx=next((i for i,p in enumerate(pairs) if p[2]==rw),None)
+            if idx is not None: pairs.pop(idx); rw.destroy()
+
+        add_btn.config(command=lambda:add_row())
+        for kv,vv in self.params[key]: add_row(kv,vv)
+        self._vars[key]=pairs; return pairs
+
+    def _core(self,p):
+        p.columnconfigure(2,weight=1)
+        rows=[
+            ('Leaky snap jmp (mV)',            'jmp',               'snap if |EMF−Leaky| > this'),
+            ('Blend alpha',                    'alp',               'smoothing per sample 0–1'),
+            ('Up gate upG',                    'upG',               'D > upG to confirm H2 up'),
+            ('Intensity gate inG',             'inG',               'E > inG to confirm H2 up'),
+            ('Down gate dnG',                  'dnG',               'F > dnG to confirm H2 down'),
+            ('Down intensity dnI',             'dnI',               'G < dnI to confirm H2 down'),
+            ('Recovery thresh rec',            'rec',               'K ≥ rec to update baseline'),
+            ('Baseline drift drf (mV)',        'drf',               'max |Leaky−Baseline| upward drift'),
+            ('Fast-change n_thresh',           'n_thresh',          'ΔM > n_thresh×M to accumulate N'),
+            ('ROC cap o_cap',                  'o_cap',             '80 = 6 s at 75 ms/sample'),
+            ('Recovery zero %',                'rec_zero_pct',      '|M| < this×peak → 100% recovered'),
+            ('Warmup samples',                 'warmup_samples',    '# samples before baseline valid'),
+            ('Daughter→Mother proximity (mV)', 'daughter_mother_prox','daughter within this of mother → LOW LEAKS ready'),
+        ]
+        tk.Label(p,text='Core Logic Parameters',bg=BG,fg=ACC,font=('Segoe UI',11,'bold')).grid(row=0,column=0,columnspan=3,sticky='w',padx=8,pady=(10,6))
+        for r,(lbl,key,tip) in enumerate(rows,1): self._row(p,r,lbl,key,tip)
+
+    def _overrange(self,p):
+        p.columnconfigure(2,weight=1)
+        tk.Label(p,text='Overrange Routine Parameters',bg=BG,fg=C_OR,font=('Segoe UI',11,'bold')).grid(row=0,column=0,columnspan=3,sticky='w',padx=8,pady=(10,6))
+        desc=("Fully independent state machine — suspends ALL normal H2 logic.\n\n"
+              "Flow:  EMF > or_thresh  →  OVERRANGE  (all logic frozen)\n"
+              "       EMF < or_exit_mv →  WAIT DROP  (watch SD)\n"
+              "       SD < or_sd_stable →  STABLE     (CALIBRATE button appears)\n"
+              "       Press CALIBRATE  →  Master Reset — new baseline — NORMAL")
+        tk.Label(p,text=desc,bg=BG,fg=DIM,font=('Segoe UI',8),justify='left',wraplength=560).grid(row=1,column=0,columnspan=3,sticky='w',padx=8,pady=(0,10))
+        rows=[
+            ('Overrange entry (mV)','or_thresh','EMF > this → enter OVERRANGE (default 720 mV)'),
+            ('Exit threshold (mV)','or_exit_mv','EMF must fall below this before SD is checked (default 20 mV)'),
+            ('Stable SD threshold (mV)','or_sd_stable','SD < this → show CALIBRATE button (default 0.00002)'),
+        ]
+        for r,(lbl,key,tip) in enumerate(rows,2): self._row(p,r,lbl,key,tip)
+
+    def _ramp(self,p):
+        cols=tk.Frame(p,bg=BG); cols.pack(fill='both',expand=True)
+        lf=tk.Frame(cols,bg=BG); lf.pack(side='left',fill='both',expand=True)
+        rf=tk.Frame(cols,bg=BG); rf.pack(side='left',fill='both',expand=True)
+        self._make_table(lf,'Upward ramp_up (D:E)','ramp_up','EMF (mV)','Ramp rate')
+        self._make_table(rf,'Downward ramp_dn (F:G)','ramp_dn','EMF (mV)','Drop rate')
+
+    def _calib_tab(self,p):
+        tk.Label(p,text='Calibration: P clip (mV) → H2 ppm',bg=BG,fg=ACC,font=('Segoe UI',10,'bold')).pack(anchor='w',padx=8,pady=(8,2))
+        tk.Label(p,text='Linear interpolation between breakpoints.',bg=BG,fg=DIM,font=('Segoe UI',8),justify='left').pack(anchor='w',padx=8)
+        self._make_table(p,'','calib','Clip P (mV)','Concentration (ppm)',scrollable=True)
+
+    def _stab(self,p):
+        self._make_table(p,'Stability/Recovery — SD → factor','stab_rec','SD breakpoint','Recovery factor')
+
+    def _collect(self):
+        pr={}
+        scalar_keys=['jmp','alp','upG','inG','dnG','dnI','rec','drf',
+                     'n_thresh','o_cap','rec_zero_pct','warmup_samples',
+                     'or_thresh','or_exit_mv','or_sd_stable','daughter_mother_prox']
+        for k in scalar_keys:
+            try:    pr[k]=float(self._vars[k].get())
+            except: pr[k]=DEFAULT_PARAMS.get(k,0)
+        pr['o_cap']=int(pr['o_cap']); pr['warmup_samples']=int(pr['warmup_samples'])
+        for tk_ in ('ramp_up','ramp_dn','calib','stab_rec'):
+            rows=[]
+            for sk,sv,*_ in self._vars[tk_]:
+                try: rows.append((float(sk.get()),float(sv.get())))
+                except: pass
+            rows.sort(key=lambda x:x[0]); pr[tk_]=rows
+        return pr
+
+    def _apply(self):       new=self._collect(); self.params=new; self.on_apply(new)
+    def _apply_close(self): self._apply(); self.withdraw()
+    def _reset_defaults(self):
+        if messagebox.askyesno("Reset","Reset all to factory defaults?",parent=self):
+            self.destroy(); self.__init__(self.master,DEFAULT_PARAMS,self.on_apply)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN APP
+# ═══════════════════════════════════════════════════════════════════════════════
+class App:
+    WIN         = 1200
+    INTERVAL    = 50
+    CHART_EVERY = 250   # ms between chart redraws
+
+    def __init__(self, root):
+        self.root=root
+        self.root.title("T5 Sensor Sim  [V2.9.3]")
+        self.root.configure(bg=BG)
+        self.root.geometry("1280x700")
+        self.root.minsize(1000,580)
+        self.params=dict(DEFAULT_PARAMS)
+
+        self.raw_data=[]; self.times=self.emf_arr=None
+        self.C=self.D=self.E=self.FF=self.G=self.H=self.II=None
+        self.J=self.K=self.L=self.MB_arr=self.M=self.N_=self.O_=None
+        self.Pv=self.Q_=self.RC_=self.OR_STATE_arr=None
+
+        self._calib_offset=0; self._live_calibs=set(); self._batch_calibs=set()
+        self._live_tears=set(); self._batch_tears=set()
+
+        self.sim_idx=0; self.running=False; self._after_id=None
+        self._last_flag=None; self._prog_w=0; self._last_chart_ms=0
+
+        self._live_mode=False; self._live_state=LiveState()
+        self._live_thread=None; self._live_after=None
+        self._live_last_flag=None; self._ic=None; self._live_warmup_done=False
+
+        self._flash_after=None; self._flash_state=False; self._flash_active=False
+        self._or_flash_after=None; self._or_flash_state=False
+        self._or_flash_active=False; self._or_which=None
+        self._last_or_state='normal'; self._calib_btn_visible=False
+
+        self._ready_flash_after=None; self._ready_flash_state=False
+        self._ready_flash_active=False; self._ready_flash_low=True
+
+        self._current_disp_flag=None
+
+        self._poweroff_warn_after=None
+        self._poweroff_warn_active=False
+
+        self._memory=_load_memory()
+        self._prev_mother_baseline=self._memory.get('mother_baseline',None)
+
+        self._compute_q=queue.Queue()
+        self._build_ui()
+        self._init_charts()
+        self._edit_win=EditWindow(self.root,self.params,self._on_params)
+        self._edit_win.withdraw()
+        self._update_prev_mother_display()
+
+    # ── HELPERS ───────────────────────────────────────────────────────────────
+    def _daughter_near_mother(self,daughter,mother):
+        prox=float(self.params.get('daughter_mother_prox',2.0))
+        return abs(daughter-mother)<=prox
+
+    def _update_prev_mother_display(self):
+        if not hasattr(self,'prev_mb_lbl'): return
+        if self._prev_mother_baseline is not None:
+            ts=self._memory.get('timestamp','')
+            self.prev_mb_lbl.config(text=f"{self._prev_mother_baseline:.3f} mV",fg=C_MOTHER)
+            if hasattr(self,'prev_mb_ts_lbl'):
+                self.prev_mb_ts_lbl.config(text=ts[:16] if ts else 'stored',fg=DIM)
+        else:
+            self.prev_mb_lbl.config(text='-- (no record)',fg=DIM)
+            if hasattr(self,'prev_mb_ts_lbl'):
+                self.prev_mb_ts_lbl.config(text='',fg=DIM)
+
+    def _check_warmup_baseline(self,new_mother_mv):
+        if self._prev_mother_baseline is None:
+            self._log(f'✓ Warmup done — mother BL: {new_mother_mv:.3f} mV (no prev record)','info')
+            return
+        diff=abs(new_mother_mv-self._prev_mother_baseline)
+        if diff<=60.0:
+            self._log(f'✓ BL OK — new: {new_mother_mv:.3f} mV  prev: {self._prev_mother_baseline:.3f} mV  Δ={diff:.2f} mV','air')
+        else:
+            self._log(f'⚠ BL SHIFT — new: {new_mother_mv:.3f} mV  prev: {self._prev_mother_baseline:.3f} mV  Δ={diff:.2f} mV  *** OUTSIDE ±60 mV ***','warn')
+
+    def _on_params(self,new_p):
+        self.params=new_p
+        if self._live_mode and self._ic is not None:
+            old_emf=list(self._ic.emf)
+            self._ic=IncrementalCompute(self.params)
+            for i,v in enumerate(old_emf):
+                self._ic.step(v)
+                if i in self._live_calibs: self._ic.do_calibrate()
+                if i in self._live_tears:  self._ic.do_manual_tear()
+            self._log('params updated — live recomputed','info')
+        elif not self._live_mode and self.emf_arr is not None:
+            self._recompute_batch()
+            self._log('params updated — batch recomputed','info')
+
+    # ── UI BUILD ──────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        tb=tk.Frame(self.root,bg=PNL,height=32,relief='flat')
+        tb.pack(fill='x',side='top')
+        tk.Frame(self.root,bg=BRD,height=1).pack(fill='x',side='top')
+        tb.pack_propagate(False)
+        tk.Label(tb,text='T5  SENSOR SIM',bg=PNL,fg=ACC,font=('Segoe UI',10,'bold')).pack(side='left',padx=10)
+        tk.Frame(tb,bg=BRD,width=1).pack(side='left',fill='y',pady=4)
+        tk.Label(tb,text='V2.9.3',bg=PNL,fg=DIM,font=('Segoe UI',7)).pack(side='left',padx=4)
+        self.lbl_info=tk.Label(tb,text='no file loaded',bg=PNL,fg=DIM,font=('Segoe UI',8))
+        self.lbl_info.pack(side='left',padx=6)
+        self.lbl_live=tk.Label(tb,text='',bg=PNL,fg=C_AIR,font=('Segoe UI',8,'bold'))
+        self.lbl_live.pack(side='left',padx=4)
+        self.lbl_stats=tk.Label(tb,text='t=--  emf=--  Δ=--  SD=--  ppm=--  rec=--%',bg=PNL,fg=DIM,font=('Segoe UI',7))
+        self.lbl_stats.pack(side='right',padx=10)
+
+        body=tk.Frame(self.root,bg=BG); body.pack(fill='both',expand=True)
+        left=tk.Frame(body,bg=PNL,width=185,relief='flat')
+        left.pack(side='left',fill='y'); left.pack_propagate(False)
+        tk.Frame(body,bg=BRD,width=1).pack(side='left',fill='y')
+
+        def sec(title):
+            tk.Frame(left,bg=SEP,height=1).pack(fill='x')
+            f=tk.Frame(left,bg=PNL); f.pack(fill='x',padx=6,pady=3)
+            tk.Label(f,text=title,bg=PNL,fg=DIM,font=('Segoe UI',6,'bold')).pack(anchor='w',pady=(0,1))
+            return f
+
+        sf=sec('SOURCE')
+        tk.Button(sf,text='📂  Browse CSV',bg=PNL2,fg=ACC,relief='flat',bd=0,font=('Segoe UI',8),cursor='hand2',command=self._browse).pack(fill='x',ipady=3,pady=1)
+        tk.Button(sf,text='📡  Live Log',bg=PNL2,fg=C_AIR,relief='flat',bd=0,font=('Segoe UI',8),cursor='hand2',command=self._browse_live).pack(fill='x',ipady=3,pady=1)
+        self.btn_live_stop=tk.Button(sf,text='⏹  Stop Live',bg=PNL2,fg=C_DN,relief='flat',bd=0,font=('Segoe UI',8),cursor='hand2',state='disabled',command=self._stop_live)
+        self.btn_live_stop.pack(fill='x',ipady=2,pady=1)
+        self.btn_tear=tk.Button(sf,text='✂  MANUAL TEAR',bg='#fff7ed',fg='#c2410c',
+                                 relief='flat',bd=0,font=('Segoe UI',8,'bold'),cursor='hand2',
+                                 state='disabled',command=self._do_manual_tear)
+        self.btn_tear.pack(fill='x',ipady=3,pady=(3,0))
+        tk.Label(sf,text='Sets mother baseline = current EMF',bg=PNL,fg=DIM,font=('Segoe UI',6),anchor='w').pack(fill='x')
+
+        tk.Frame(left,bg=SEP,height=1).pack(fill='x')
+        pof=tk.Frame(left,bg=PNL); pof.pack(fill='x',padx=6,pady=3)
+        tk.Label(pof,text='SYSTEM',bg=PNL,fg=DIM,font=('Segoe UI',6,'bold')).pack(anchor='w',pady=(0,1))
+        self.btn_poweroff=tk.Button(pof,text='⏻  POWER OFF',bg='#fef2f2',fg='#dc2626',
+                                     relief='flat',bd=0,font=('Segoe UI',8,'bold'),cursor='hand2',
+                                     state='disabled',command=self._do_poweroff)
+        self.btn_poweroff.pack(fill='x',ipady=4,pady=(0,1))
+        tk.Label(pof,text='Saves mother BL  •  Only in AIR state',bg=PNL,fg=DIM,font=('Segoe UI',6),anchor='w').pack(fill='x')
+
+        wf=sec('WINDOW (CSV)')
+        self.e_t0=self._prow(wf,'From','0'); self.e_t1=self._prow(wf,'To','9999')
+
+        self._prog_cv=tk.Canvas(left,bg=SEP,height=3,highlightthickness=0)
+        self._prog_cv.pack(fill='x',padx=0,pady=1)
+        self._prog_cv.bind('<Configure>',lambda e:setattr(self,'_prog_w',e.width))
+
+        pf=sec('PLAYBACK')
+        sr=tk.Frame(pf,bg=PNL); sr.pack(fill='x',pady=(0,2))
+        tk.Label(sr,text='Speed',bg=PNL,fg=DIM,font=('Segoe UI',7),width=5).pack(side='left')
+        self.spd_var=tk.IntVar(value=30)
+        self.lbl_spd=tk.Label(sr,text='30×',bg=PNL,fg=ACC,font=('Segoe UI',8,'bold'),width=4)
+        self.lbl_spd.pack(side='right')
+        tk.Scale(sr,from_=1,to=500,orient='horizontal',variable=self.spd_var,bg=PNL,fg=ACC,
+                 showvalue=False,highlightthickness=0,troughcolor=SEP,bd=0,
+                 command=lambda v:self.lbl_spd.config(text=f'{v}×')).pack(side='left',fill='x',expand=True)
+        br=tk.Frame(pf,bg=PNL); br.pack(fill='x')
+        self.btn_play=self._btn(br,'▶ Play',self._play,ACC,'#fff')
+        self.btn_pause=self._btn(br,'⏸',self._pause,PNL2,ACC)
+        self.btn_reset=self._btn(br,'↺',self._reset,PNL2,DIM)
+        for b in (self.btn_play,self.btn_pause,self.btn_reset): b.config(state='disabled')
+
+        ef=sec('PARAMETERS')
+        tk.Button(ef,text='⚙  Edit Parameters',bg=PNL2,fg=ACC,relief='flat',bd=0,font=('Segoe UI',8),cursor='hand2',command=self._show_edit).pack(fill='x',ipady=3)
+
+        mf=sec('LIVE VALUES')
+        self.mv={}
+        grid=tk.Frame(mf,bg=PNL); grid.pack(fill='x')
+        items=[('C','Leaky mV'),('M','ΔBase mV'),('J','SD'),('REC','Rec %'),
+               ('N','N accum'),('O','ROC O'),('P','Clip P'),('Q','ppm Q')]
+        for idx,(k,name) in enumerate(items):
+            r,c=divmod(idx,2)
+            cell=tk.Frame(grid,bg=PNL2,relief='flat'); cell.grid(row=r,column=c,padx=1,pady=1,sticky='ew')
+            nc=(C_CONC if k in ('N','O','P','Q') else C_REC if k=='REC' else DIM)
+            tk.Label(cell,text=name,bg=PNL2,fg=nc,font=('Segoe UI',6,'bold')).pack(anchor='w',padx=3,pady=(2,0))
+            lbl=tk.Label(cell,text='--',bg=PNL2,fg=FG,font=('Segoe UI',8,'bold'))
+            lbl.pack(anchor='w',padx=3,pady=(0,2)); self.mv[k]=lbl
+        grid.columnconfigure(0,weight=1); grid.columnconfigure(1,weight=1)
+
+        bf=sec('BASELINES')
+        bgrid=tk.Frame(bf,bg=PNL); bgrid.pack(fill='x')
+        for bi,(bname,bcol,bkey) in enumerate([
+            ('Mother BL',C_MOTHER,'mb_lbl'),
+            ('Daughter BL',C_BAS,'db_lbl'),
+        ]):
+            bcell=tk.Frame(bgrid,bg=PNL2,relief='flat')
+            bcell.grid(row=0,column=bi,padx=1,pady=1,sticky='ew')
+            tk.Label(bcell,text=bname,bg=PNL2,fg=bcol,font=('Segoe UI',6,'bold')).pack(anchor='w',padx=3,pady=(2,0))
+            lbl=tk.Label(bcell,text='--',bg=PNL2,fg=FG,font=('Segoe UI',8,'bold'))
+            lbl.pack(anchor='w',padx=3,pady=(0,2)); setattr(self,bkey,lbl)
+        bgrid.columnconfigure(0,weight=1); bgrid.columnconfigure(1,weight=1)
+
+        prev_cell=tk.Frame(bf,bg='#fffbeb',relief='flat'); prev_cell.pack(fill='x',padx=1,pady=(1,0))
+        tk.Label(prev_cell,text='Prev. Mother BL (stored)',bg='#fffbeb',fg=C_MOTHER,
+                 font=('Segoe UI',6,'bold')).pack(anchor='w',padx=3,pady=(2,0))
+        self.prev_mb_lbl=tk.Label(prev_cell,text='-- (no record)',bg='#fffbeb',fg=DIM,
+                                   font=('Segoe UI',8,'bold'))
+        self.prev_mb_lbl.pack(anchor='w',padx=3,pady=(0,0))
+        self.prev_mb_ts_lbl=tk.Label(prev_cell,text='',bg='#fffbeb',fg=DIM,font=('Segoe UI',6))
+        self.prev_mb_ts_lbl.pack(anchor='w',padx=3,pady=(0,2))
+
+        # ── RIGHT PANEL ──────────────────────────────────────────────────────
+        right=tk.Frame(body,bg=BG); right.pack(side='left',fill='both',expand=True)
+
+        # ── FLAG STRIP ───────────────────────────────────────────────────────
+        flag_strip=tk.Frame(right,bg=PNL,height=76)
+        flag_strip.pack(fill='x',side='top'); flag_strip.pack_propagate(False)
+        tk.Frame(right,bg=BRD,height=1).pack(fill='x',side='top')
+
+        self.flag_boxes={}
+        flag_defs=[
+            (-1,'AIR / BASELINE',C_AIR,'#f0fdf4',False,False,True),
+            (1,'H2 CONFIRMED ▲',C_UP,'#fffbeb',True,False,False),
+            (-2,'H2 DOWN ▼',C_DN,'#fef2f2',False,False,False),
+            (-3,'RECOVERING',C_REC,'#faf5ff',False,True,False),
+        ]
+        for val,name,col,bg2,has_conc,has_rec,has_ready in flag_defs:
+            box=tk.Frame(flag_strip,bg=PNL,relief='flat',bd=0)
+            box.pack(side='left',fill='both',expand=True,padx=2,pady=3)
+            dot=tk.Label(box,text='●',bg=PNL,fg=BRD,font=('Segoe UI',9))
+            dot.pack(side='left',padx=(6,2),pady=1)
+            inner=tk.Frame(box,bg=PNL); inner.pack(side='left',fill='both',expand=True,pady=1)
+            nlbl=tk.Label(inner,text=name,bg=PNL,fg=DIM,font=('Segoe UI',7,'bold'))
+            nlbl.pack(anchor='w')
+            clbl=tk.Label(inner,text='0 events',bg=PNL,fg=DIM,font=('Segoe UI',6))
+            clbl.pack(anchor='w')
+            
+            conc_lbl = None
+            if has_conc:
+                conc_lbl=tk.Label(inner,text='',bg=PNL,fg=DIM,font=('Segoe UI',9,'bold'))
+                conc_lbl.pack(anchor='w')
+                
+            rec_bar = rec_msg = None
+            if has_rec:
+                rec_bar=ttk.Progressbar(inner,orient='horizontal',length=80,mode='determinate')
+                rec_bar.pack(anchor='w',pady=(1,0))
+                rec_msg=tk.Label(inner,text='0%',bg=PNL,fg=C_REC,font=('Segoe UI',7,'bold'))
+                rec_msg.pack(anchor='w',pady=(1,0))
+
+            ready_msg = None
+            if has_ready:
+                ready_msg = tk.Label(inner, text='', bg=PNL, fg=C_AIR, font=('Segoe UI',7,'bold'))
+                ready_msg.pack(anchor='w', pady=(1,0))
+
+            self.flag_boxes[val]={
+                'frame':box,'dot':dot,'name':nlbl,'count':clbl,'col':col,'bg':bg2,'events':0,
+                'conc_lbl':conc_lbl,'rec_bar':rec_bar,
+                'rec_msg':rec_msg, 
+                'ready_msg':ready_msg,
+                'inner':inner,'_bg_now':PNL,
+            }
+
+        # Overrange box
+        sep_or=tk.Frame(flag_strip,bg=BRD,width=2); sep_or.pack(side='left',fill='y',pady=3)
+        or_box=tk.Frame(flag_strip,bg=PNL,relief='flat',bd=0,width=140)
+        or_box.pack(side='left',fill='y',padx=2,pady=3); or_box.pack_propagate(False)
+        or_dot=tk.Label(or_box,text='●',bg=PNL,fg=BRD,font=('Segoe UI',9))
+        or_dot.pack(side='left',padx=(5,2),pady=1)
+        or_inner=tk.Frame(or_box,bg=PNL); or_inner.pack(side='left',fill='both',expand=True,pady=1)
+        or_nlbl=tk.Label(or_inner,text='NORMAL',bg=PNL,fg=DIM,font=('Segoe UI',7,'bold'))
+        or_nlbl.pack(anchor='w')
+        or_sublbl=tk.Label(or_inner,text='EMF in range',bg=PNL,fg=DIM,font=('Segoe UI',6))
+        or_sublbl.pack(anchor='w')
+        self.btn_calib=tk.Button(or_inner,text='⚡ CALIBRATE',bg=C_STB,fg='#fff',
+                                  font=('Segoe UI',6,'bold'),relief='flat',cursor='hand2',
+                                  padx=3,pady=1,command=self._do_calibrate)
+        self._or_box={'frame':or_box,'dot':or_dot,'name':or_nlbl,'sub':or_sublbl,'inner':or_inner}
+
+        chart_frame=tk.Frame(right,bg=BG); chart_frame.pack(fill='both',expand=True)
+        self.fig=plt.Figure(figsize=(9,3.8),facecolor=PNL)
+        gs=gridspec.GridSpec(2,1,figure=self.fig,hspace=0.45,left=0.06,right=0.97,top=0.96,bottom=0.07)
+        self.ax1=self.fig.add_subplot(gs[0]); self.ax2=self.fig.add_subplot(gs[1])
+        self.mpl=FigureCanvasTkAgg(self.fig,master=chart_frame)
+        self.mpl.get_tk_widget().pack(fill='both',expand=True)
+
+        log_f=tk.Frame(right,bg=PNL,height=36)
+        log_f.pack(fill='x',side='bottom'); log_f.pack_propagate(False)
+        tk.Frame(log_f,bg=BRD,height=1).pack(fill='x',side='top')
+        tk.Label(log_f,text='EVENT LOG',bg=PNL,fg=DIM,font=('Segoe UI',6,'bold')).pack(anchor='w',padx=6,pady=(1,0))
+        self.log=tk.Text(log_f,bg=PNL,fg=DIM,font=('Segoe UI',7),relief='flat',state='disabled',height=2)
+        self.log.pack(fill='both',expand=True,padx=6,pady=(0,1))
+        for tag,col in [
+            ('air',C_AIR),('up',C_UP),('dn',C_DN),('rec',C_REC),('info',ACC),('conc',C_CONC),
+            ('warn','#d97706'),('overrange',C_OR),('stable',C_STB),
+            ('tear','#c2410c'),('poweroff','#dc2626'),
+        ]:
+            self.log.tag_config(tag,foreground=col)
+        self._log('waiting for file…','info')
+
+    def _prow(self,parent,label,default):
+        row=tk.Frame(parent,bg=PNL); row.pack(fill='x',pady=1)
+        tk.Label(row,text=label,bg=PNL,fg=DIM,font=('Segoe UI',7),anchor='w').pack(side='left',fill='x',expand=True)
+        sv=tk.StringVar(value=default)
+        tk.Entry(row,textvariable=sv,width=6,bg=PNL2,fg=FG,insertbackground=FG,relief='solid',bd=1,font=('Segoe UI',7),justify='right').pack(side='right')
+        return sv
+
+    def _btn(self,parent,text,cmd,bg,fg):
+        b=tk.Button(parent,text=text,command=cmd,bg=bg,fg=fg,activebackground=ACC,
+                    activeforeground='#fff',relief='flat',bd=0,font=('Segoe UI',8,'bold'),
+                    padx=5,pady=3,cursor='hand2')
+        b.pack(side='left',fill='x',expand=True,padx=1); return b
+
+    def _log(self,msg,tag='info',t='--'):
+        self.log.config(state='normal')
+        self.log.insert('end',f'{str(t):>7}s  {msg}\n',tag)
+        self.log.see('end'); self.log.config(state='disabled')
+
+    def _clear_log(self):
+        self.log.config(state='normal'); self.log.delete('1.0','end')
+        self.log.config(state='disabled')
+
+    def _show_edit(self):
+        if self._edit_win.winfo_exists():
+            self._edit_win.deiconify(); self._edit_win.lift()
+        else:
+            self._edit_win=EditWindow(self.root,self.params,self._on_params)
+
+    # ── H2 FLASH ──────────────────────────────────────────────────────────────
+    _FLASH_A={'bg':'#d97706','dot':'#ffffff','name':'#ffffff','count':'#fef3c7','conc':'#ffffff','inner':'#d97706'}
+    _FLASH_B={'bg':'#7c2d12','dot':'#fbbf24','name':'#fde68a','count':'#fde68a','conc':'#fbbf24','inner':'#7c2d12'}
+
+    def _start_flash(self):
+        if self._flash_active: return
+        self._flash_active=True; self._flash_state=False; self._do_flash()
+
+    def _do_flash(self):
+        if not self._flash_active: return
+        self._flash_state=not self._flash_state
+        pal=self._FLASH_A if self._flash_state else self._FLASH_B
+        d=self.flag_boxes.get(1)
+        if d:
+            d['frame'].config(bg=pal['bg']); d['dot'].config(bg=pal['bg'],fg=pal['dot'])
+            d['name'].config(bg=pal['bg'],fg=pal['name']); d['count'].config(bg=pal['bg'],fg=pal['count'])
+            d['inner'].config(bg=pal['bg'])
+            if d['conc_lbl']: d['conc_lbl'].config(bg=pal['bg'],fg=pal['conc'])
+        self._flash_after=self.root.after(240,self._do_flash)
+
+    def _stop_flash(self):
+        self._flash_active=False
+        if self._flash_after: self.root.after_cancel(self._flash_after); self._flash_after=None
+
+    # ── OVERRANGE FLASH ──────────────────────────────────────────────────────
+    _OR_FLASH_OVER_A={'bg':'#dc2626','dot':'#ffffff','name':'#ffffff','sub':'#fecaca'}
+    _OR_FLASH_OVER_B={'bg':'#7f1d1d','dot':'#fca5a5','name':'#fecaca','sub':'#fca5a5'}
+    _OR_FLASH_STAB_A={'bg':'#16a34a','dot':'#ffffff','name':'#ffffff','sub':'#bbf7d0'}
+    _OR_FLASH_STAB_B={'bg':'#14532d','dot':'#86efac','name':'#dcfce7','sub':'#86efac'}
+
+    def _start_or_flash(self,which):
+        self._stop_or_flash(); self._or_which=which; self._or_flash_active=True
+        self._or_flash_state=False; self._do_or_flash()
+
+    def _do_or_flash(self):
+        if not self._or_flash_active: return
+        self._or_flash_state=not self._or_flash_state
+        pal=(self._OR_FLASH_OVER_A if self._or_flash_state else self._OR_FLASH_OVER_B) if self._or_which=='overrange' else (self._OR_FLASH_STAB_A if self._or_flash_state else self._OR_FLASH_STAB_B)
+        d=self._or_box
+        d['frame'].config(bg=pal['bg']); d['dot'].config(bg=pal['bg'],fg=pal['dot'])
+        d['name'].config(bg=pal['bg'],fg=pal['name']); d['sub'].config(bg=pal['bg'],fg=pal['sub'])
+        d['inner'].config(bg=pal['bg']); self.btn_calib.config(bg=pal['bg'])
+        self._or_flash_after=self.root.after(240,self._do_or_flash)
+
+    def _stop_or_flash(self):
+        self._or_flash_active=False; self._or_which=None
+        if self._or_flash_after: self.root.after_cancel(self._or_flash_after); self._or_flash_after=None
+        d=self._or_box
+        for w in (d['frame'],d['dot'],d['name'],d['sub'],d['inner']): w.config(bg=PNL)
+        d['dot'].config(fg=BRD); d['name'].config(fg=DIM); d['sub'].config(fg=DIM)
+
+    # ── READY (AIR / BASELINE) FLASH ──────────────────────────────────────────
+    def _start_ready_flash(self, low_leaks: bool):
+        self._stop_ready_flash()
+        self._ready_flash_low = low_leaks
+        self._ready_flash_active = True
+        self._ready_flash_state = False
+        self._do_ready_flash()
+
+    def _do_ready_flash(self):
+        if not self._ready_flash_active: return
+        self._ready_flash_state = not self._ready_flash_state
+        d = self.flag_boxes.get(-1)
+        if d and d.get('ready_msg'):
+            bg2 = d.get('_bg_now', '#f0fdf4')
+            if self._ready_flash_low:
+                ready_txt = '◉ READY: LOW LEAKS' if self._ready_flash_state else '○ READY: LOW LEAKS'
+                col = C_AIR if self._ready_flash_state else '#6ee7b7'
+            else:
+                ready_txt = '◉ READY: LARGE LEAKS' if self._ready_flash_state else '○ READY: LARGE LEAKS'
+                col = C_UP if self._ready_flash_state else '#fcd34d'
+            
+            d['ready_msg'].config(text=ready_txt, fg=col, bg=bg2)
+        self._ready_flash_after = self.root.after(400, self._do_ready_flash)
+
+    def _stop_ready_flash(self):
+        self._ready_flash_active = False
+        if self._ready_flash_after:
+            self.root.after_cancel(self._ready_flash_after)
+            self._ready_flash_after = None
+        d = self.flag_boxes.get(-1)
+        if d and d.get('ready_msg'):
+            bg2 = d.get('_bg_now', PNL)
+            d['ready_msg'].config(text='', bg=bg2)
+
+    def _update_or_box(self,or_state,t='--'):
+        prev=self._last_or_state; self._last_or_state=or_state
+        d=self._or_box
+        if or_state=='normal':
+            self.btn_calib.pack_forget(); self.btn_calib.place_forget()
+            self._calib_btn_visible=False
+            if prev!='normal':
+                self._stop_or_flash()
+                d['name'].config(text='NORMAL',fg=DIM); d['sub'].config(text='EMF in range',fg=DIM)
+        elif or_state=='overrange':
+            self.btn_calib.pack_forget(); self.btn_calib.place_forget()
+            self._calib_btn_visible=False
+            if prev!='overrange':
+                self._stop_flash(); self._reset_flag_boxes_for_overrange()
+                self._start_or_flash('overrange')
+                d['name'].config(text='⚠ OVERRANGE',fg='#ffffff')
+                d['sub'].config(text='EMF > threshold',fg='#fecaca')
+                if prev=='normal': self._log('⚠ OVERRANGE — all H2 logic suspended','overrange',t)
+        elif or_state=='waiting_drop':
+            self.btn_calib.pack_forget(); self.btn_calib.place_forget()
+            self._calib_btn_visible=False
+            if prev!='waiting_drop':
+                self._start_or_flash('overrange')
+                d['name'].config(text='⬇ WAIT DROP',fg='#ffffff')
+                d['sub'].config(text=f'Wait EMF < {self.params.get("or_exit_mv",20):.0f} mV',fg='#fecaca')
+                self._log('↓ Overrange exit — waiting for EMF to drop','overrange',t)
+        elif or_state=='stable':
+            if prev!='stable':
+                self._start_or_flash('stable')
+                d['name'].config(text='✔ STABLE',fg='#ffffff')
+                d['sub'].config(text='SD stable — press CALIBRATE',fg='#bbf7d0')
+                if not self._calib_btn_visible:
+                    self.btn_calib.config(bg=C_STB)
+                    self.btn_calib.pack(anchor='w',pady=(1,0))
+                    self._calib_btn_visible=True
+                self._log('✔ STABLE — press CALIBRATE to set baseline and resume','stable',t)
+
+    def _reset_flag_boxes_for_overrange(self):
+        self._reset_flag_boxes()
+        d=self.flag_boxes.get(1)
+        if d and d['conc_lbl']: d['conc_lbl'].config(text='',fg=DIM,bg=PNL)
+
+    # ── CALIBRATE & BATCH RECOMPUTE ──────────────────────────────────────────
+    def _recompute_batch(self):
+        if self.emf_arr is None: return
+        params_sn=dict(self.params)
+        res=list(compute_all(self.emf_arr,params_sn))
+        for c_idx in sorted(list(self._batch_calibs|self._batch_tears)):
+            if c_idx>=len(self.emf_arr): continue
+            new_base=float(res[0][c_idx])
+            rem_emf=self.emf_arr[c_idx:]
+            res_rem=list(compute_all(rem_emf,params_sn,seed_baseline=new_base))
+            for i in range(len(res)): res[i][c_idx:]=res_rem[i]
+        (self.C,self.D,self.E,self.FF,self.G,self.H,self.II,
+         self.J,self.K,self.L,self.MB_arr,self.M,self.N_,self.O_,self.Pv,
+         self.Q_,self.RC_,self.OR_STATE_arr)=res
+
+    def _do_manual_tear(self):
+        if self._live_mode and self._ic is not None:
+            c_val=self._ic.C[-1] if self._ic.C else 0.0
+            tear_idx=len(self._ic.emf)-1
+            if self._ic.do_manual_tear():
+                self._live_tears.add(tear_idx)
+                t=len(self._ic.emf)*0.075
+                self._log(f'✂ MANUAL TEAR @ {c_val:.3f} mV — mother baseline reset','tear',f'{t:.1f}')
+        elif not self._live_mode and self.C is not None and self.sim_idx>0:
+            tear_idx=self.sim_idx-1; c_val=float(self.C[tear_idx])
+            self._batch_tears.add(tear_idx); self._recompute_batch()
+            t=self.times[tear_idx] if self.times is not None else tear_idx*0.075
+            self._log(f'✂ MANUAL TEAR @ {c_val:.3f} mV — mother baseline reset, recomputed','tear',f'{t:.1f}')
+            idx=self.sim_idx; s=max(0,idx-self.WIN); tl=self.times[s:idx]
+            self._update_charts(tl,self.emf_arr[s:idx],self.C[s:idx],self.L[s:idx],
+                                self.MB_arr[s:idx],self.N_[s:idx],self.Pv[s:idx],
+                                self.Q_[s:idx],self.RC_[s:idx],
+                                or_thr=float(self.params.get('or_thresh',720.0)))
+            self.mpl.draw_idle()
+        else:
+            messagebox.showinfo('Tear','No data available to tear against.')
+
+    def _do_calibrate(self):
+        if self._live_mode and self._ic is not None:
+            calib_idx=len(self._ic.emf)-1
+            if self._ic.do_calibrate():
+                self._live_calibs.add(calib_idx)
+                new_base=self._ic.C[-1] if self._ic.C else 0.0
+                self._stop_or_flash(); self._stop_flash()
+                d=self._or_box
+                d['name'].config(text='NORMAL',fg=DIM,bg=PNL)
+                d['sub'].config(text='Calibrated ✓',fg=C_STB,bg=PNL)
+                d['frame'].config(bg=PNL); d['dot'].config(bg=PNL,fg=BRD); d['inner'].config(bg=PNL)
+                self.btn_calib.pack_forget(); self._calib_btn_visible=False
+                self._last_or_state='normal'; self._live_last_flag=-1
+                self._current_disp_flag=-1
+                self._highlight_flag(-1)
+                self._log(f'★ CALIBRATED @ {new_base:.3f} mV','stable')
+                self._live_warmup_done=True
+        elif not self._live_mode:
+            or_state_now=str(self.OR_STATE_arr[self.sim_idx-1]) if (self.OR_STATE_arr is not None and self.sim_idx>0) else 'normal'
+            if or_state_now=='stable' or self._last_or_state=='stable':
+                if self.C is not None and self.sim_idx>0:
+                    calib_idx=self.sim_idx-1; new_base=float(self.C[calib_idx])
+                    self._batch_calibs.add(calib_idx); self._recompute_batch()
+                    self._stop_or_flash(); self._stop_flash()
+                    d=self._or_box
+                    d['name'].config(text='NORMAL',fg=DIM,bg=PNL)
+                    d['sub'].config(text='Calibrated ✓',fg=C_STB,bg=PNL)
+                    d['frame'].config(bg=PNL); d['dot'].config(bg=PNL,fg=BRD); d['inner'].config(bg=PNL)
+                    self.btn_calib.pack_forget(); self._calib_btn_visible=False
+                    self._last_or_state='normal'; self._last_flag=-1
+                    self._current_disp_flag=-1
+                    self._highlight_flag(-1)
+                    self._log(f'★ CALIBRATED @ {new_base:.3f} mV','stable')
+
+    # ── POWER OFF ─────────────────────────────────────────────────────────────
+    def _do_poweroff(self):
+        can_poweroff=False; current_mother=None
+        if self._live_mode and self._ic is not None:
+            last=self._ic.last()
+            if last is not None:
+                can_poweroff=(self._live_last_flag==-1)
+                current_mother=last.get('mother_baseline',None)
+        elif not self._live_mode and self.C is not None and self.sim_idx>0:
+            can_poweroff=(self._last_flag==-1)
+            if self.MB_arr is not None: current_mother=float(self.MB_arr[self.sim_idx-1])
+        else:
+            can_poweroff=True
+
+        if not can_poweroff:
+            self._show_poweroff_warning(); return
+
+        saved=False
+        if current_mother is not None:
+            saved=_save_memory(current_mother)
+            if saved:
+                self._prev_mother_baseline=current_mother
+                self._memory=_load_memory()
+                self._update_prev_mother_display()
+                self._log(f'⏻ POWER OFF — mother BL saved: {current_mother:.3f} mV','poweroff')
+            else:
+                self._log('⏻ POWER OFF — WARNING: could not save BL to memory','warn')
+        self._show_poweroff_overlay(current_mother,saved)
+
+    def _show_poweroff_warning(self):
+        if self._poweroff_warn_active: return
+        self._poweroff_warn_active=True
+        warn_lbl=tk.Label(self.root,
+            text='⚠  BRING SENSOR TO AMBIENT CONDITION FIRST\n(Wait for AIR / BASELINE state)',
+            bg='#dc2626',fg='#ffffff',font=('Segoe UI',12,'bold'),relief='flat',padx=18,pady=10)
+        warn_lbl.place(relx=0.5,rely=0.5,anchor='center')
+        self._log('⚠ Power-off blocked — sensor not in AIR/BASELINE state','warn')
+        _flash_count=[0]
+        def _flash():
+            if not warn_lbl.winfo_exists(): return
+            _flash_count[0]+=1
+            col='#dc2626' if _flash_count[0]%2==0 else '#7f1d1d'
+            warn_lbl.config(bg=col)
+            if _flash_count[0]<6: self.root.after(300,_flash)
+            else: self.root.after(800,lambda: (warn_lbl.destroy(), setattr(self,'_poweroff_warn_active',False)))
+        _flash()
+
+    def _show_poweroff_overlay(self,mother_val,saved):
+        overlay=tk.Frame(self.root,bg='#1e293b')
+        overlay.place(x=0,y=0,relwidth=1,relheight=1)
+        tk.Label(overlay,text='⏻',bg='#1e293b',fg='#dc2626',font=('Segoe UI',40)).pack(pady=(60,8))
+        tk.Label(overlay,text='SYSTEM POWERED OFF',bg='#1e293b',fg='#f1f5f9',font=('Segoe UI',18,'bold')).pack()
+        if mother_val is not None and saved:
+            tk.Label(overlay,text=f'Mother Baseline saved: {mother_val:.3f} mV',
+                     bg='#1e293b',fg=C_MOTHER,font=('Segoe UI',12)).pack(pady=(12,3))
+            ts=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            tk.Label(overlay,text=f'Saved at: {ts}',bg='#1e293b',fg='#64748b',font=('Segoe UI',9)).pack()
+        else:
+            tk.Label(overlay,text='(No baseline data saved)',bg='#1e293b',fg='#64748b',font=('Segoe UI',10)).pack(pady=12)
+        tk.Label(overlay,text='Close the application window to exit,\nor press Resume to continue.',
+                 bg='#1e293b',fg='#94a3b8',font=('Segoe UI',9)).pack(pady=(24,12))
+        tk.Button(overlay,text='▶  RESUME SESSION',bg=C_AIR,fg='#ffffff',font=('Segoe UI',10,'bold'),
+                  relief='flat',cursor='hand2',padx=20,pady=8,command=overlay.destroy).pack()
+        tk.Button(overlay,text='✕  EXIT APPLICATION',bg='#dc2626',fg='#ffffff',font=('Segoe UI',9),
+                  relief='flat',cursor='hand2',padx=14,pady=6,command=self.root.destroy).pack(pady=(6,0))
+
+    # ── CHARTS ────────────────────────────────────────────────────────────────
+    def _init_charts(self):
+        for ax,title,ylabel in [
+            (self.ax1,'EMF  ·  Leaky  ·  Daughter BL  ·  Mother BL (mV)','mV'),
+            (self.ax2,'H₂ Concentration — ppm','ppm'),
+        ]:
+            ax.set_facecolor('#f8fafc')
+            ax.set_title(title,color=DIM,fontsize=7,loc='left',pad=2,fontweight='bold')
+            ax.tick_params(colors=DIM,labelsize=6,length=2)
+            ax.set_ylabel(ylabel,color=DIM,fontsize=6)
+            for sp in ax.spines.values(): sp.set_edgecolor(BRD)
+            ax.grid(color=SEP,lw=0.8,alpha=0.8)
+
+        def time_fmt(x,pos):
+            if not np.isfinite(x) or x<0 or x>86400: return ""
+            m,s=divmod(int(x),60); return f'{m:02d}:{s:02d}'
+        fmt=ticker.FuncFormatter(time_fmt)
+        for ax in (self.ax1,self.ax2):
+            ax.xaxis.set_major_formatter(fmt)
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=8,integer=True))
+
+        self.ln_raw,=self.ax1.plot([],[],color=C_RAW,lw=0.8,label='Raw EMF',alpha=0.6)
+        self.ln_lea,=self.ax1.plot([],[],color=C_LEA,lw=1.0,label='Leaky C')
+        self.ln_bas,=self.ax1.plot([],[],color=C_BAS,lw=1.2,ls='--',label='Daughter BL')
+        self.ln_mother,=self.ax1.plot([],[],color=C_MOTHER,lw=1.5,ls=':',label='Mother BL')
+        self.ln_or_thr,=self.ax1.plot([],[],color=C_OR,lw=0.8,ls=':',alpha=0.5,label='OR thresh')
+        self.ax1.legend(fontsize=6,loc='upper right',facecolor=PNL,labelcolor=DIM,framealpha=0.9,edgecolor=BRD)
+
+        self.ax2b=self.ax2.twinx()
+        self.ax2b.tick_params(colors=C_REC,labelsize=6,length=2)
+        self.ax2b.set_ylabel('Rec%',color=C_REC,fontsize=6)
+        self.ln_Q,=self.ax2.plot([],[],color=C_CONC,lw=1.2,label='ppm Q')
+        self.ln_P,=self.ax2.plot([],[],color=C_UP,lw=0.7,ls=':',alpha=0.8,label='P clip')
+        self.ln_N,=self.ax2.plot([],[],color=C_RAW,lw=0.6,ls='--',alpha=0.5,label='N accum')
+        self.ln_REC,=self.ax2b.plot([],[],color=C_REC,lw=0.8,ls='-.',alpha=0.7,label='Rec%')
+        self.ax2.legend(fontsize=6,loc='upper left',facecolor=PNL,labelcolor=DIM,framealpha=0.9,edgecolor=BRD)
+        self.ax2.set_ylabel('ppm',color=C_CONC,fontsize=6)
+        self.mpl.draw()
+
+    def _update_charts(self,tl,raw,C,L,MB,N,Pv,Q,RC,or_thr=720.0):
+        now_ms=time.monotonic()*1000
+        if now_ms-self._last_chart_ms<self.CHART_EVERY: return
+        self._last_chart_ms=now_ms
+        if len(tl)<2: return
+        x_min=float(tl[0]); x_max=float(tl[-1])
+        if not (np.isfinite(x_min) and np.isfinite(x_max)) or x_max<=x_min: return
+        n_pts=len(tl)
+        if n_pts>1000:
+            ds=n_pts//1000; tl=tl[::ds]; raw=raw[::ds]; C=C[::ds]
+            L=L[::ds]; MB=MB[::ds]; N=N[::ds]; Pv=Pv[::ds]; Q=Q[::ds]; RC=RC[::ds]
+        self.ax1.set_xlim(x_min,x_max); self.ax2.set_xlim(x_min,x_max)
+        self.ln_raw.set_data(tl,raw); self.ln_lea.set_data(tl,C)
+        self.ln_bas.set_data(tl,L); self.ln_mother.set_data(tl,MB)
+        self.ln_or_thr.set_data([x_min,x_max],[or_thr,or_thr])
+        self.ln_N.set_data(tl,N); self.ln_P.set_data(tl,Pv)
+        self.ln_Q.set_data(tl,Q); self.ln_REC.set_data(tl,RC)
+        if len(raw)>0:
+            raw_a=np.asarray(raw,dtype=float); c_a=np.asarray(C,dtype=float)
+            l_a=np.asarray(L,dtype=float); mb_a=np.asarray(MB,dtype=float)
+            all_y1=np.concatenate([raw_a,c_a,l_a,mb_a])
+            valid1=all_y1[np.isfinite(all_y1)]
+            if len(valid1)>0:
+                ymin1=valid1.min(); ymax1=valid1.max(); span1=ymax1-ymin1
+                if span1<MIN_MV_SPAN:
+                    mid1=(ymin1+ymax1)/2.0; ymin1=mid1-MIN_MV_SPAN/2.0; ymax1=mid1+MIN_MV_SPAN/2.0; margin1=MIN_MV_SPAN*0.06
+                else: margin1=span1*0.06
+                self.ax1.set_ylim(ymin1-margin1,ymax1+margin1)
+        if len(Q)>0:
+            q_a=np.asarray(Q,dtype=float); pv_a=np.asarray(Pv,dtype=float); n_a=np.asarray(N,dtype=float)
+            all_y2=np.concatenate([q_a,pv_a,n_a]); valid2=all_y2[np.isfinite(all_y2)]
+            if len(valid2)>0:
+                ymin2=valid2.min(); ymax2=valid2.max(); span2=ymax2-ymin2
+                if span2<MIN_PPM_SPAN:
+                    mid2=(ymin2+ymax2)/2.0; half=MIN_PPM_SPAN/2.0
+                    ymin2=max(0.0,mid2-half); ymax2=ymin2+MIN_PPM_SPAN; margin2=MIN_PPM_SPAN*0.08
+                else: margin2=span2*0.08
+                self.ax2.set_ylim(max(0.0,ymin2-margin2),ymax2+margin2)
+        self.ax2b.set_ylim(-5,105); self.mpl.draw_idle()
+
+    def _draw_prog(self,pct):
+        if not self._prog_w: return
+        self._prog_cv.delete('all')
+        self._prog_cv.create_rectangle(0,0,int(self._prog_w*pct/100),3,fill=ACC,width=0)
+
+    def _reset_flag_boxes(self):
+        self._stop_flash(); self._stop_ready_flash()
+        for d in self.flag_boxes.values():
+            for w in (d['frame'],d['dot'],d['name'],d['count'],d['inner']): w.config(bg=PNL)
+            if d['conc_lbl']: d['conc_lbl'].config(bg=PNL)
+            d['dot'].config(fg=BRD); d['name'].config(fg=DIM)
+            d['count'].config(fg=DIM,text=f"{d['events']} events")
+            if d['conc_lbl']: d['conc_lbl'].config(fg=DIM,text='')
+            if d['rec_bar']:  d['rec_bar']['value']=0
+            if d.get('rec_msg'): d['rec_msg'].config(text='0%',fg=C_REC,bg=PNL)
+            if d.get('ready_msg'): d['ready_msg'].config(text='',bg=PNL)
+            d['_bg_now']=PNL
+
+    def _highlight_flag(self,fval):
+        self._stop_flash(); self._stop_ready_flash()
+        self._reset_flag_boxes()
+        d=self.flag_boxes.get(fval)
+        if not d: return
+        col=d['col']; bg2=d['bg']
+        for w in (d['frame'],d['dot'],d['name'],d['count'],d['inner']): w.config(bg=bg2)
+        if d['conc_lbl']: d['conc_lbl'].config(bg=bg2)
+        if d.get('rec_msg'): d['rec_msg'].config(bg=bg2)
+        if d.get('ready_msg'): d['ready_msg'].config(bg=bg2)
+        d['_bg_now']=bg2
+        d['dot'].config(fg=col); d['name'].config(fg=col)
+        d['count'].config(fg=col,text=f"{d['events']} events")
+        if d['conc_lbl']: d['conc_lbl'].config(fg=C_CONC)
+        if fval==1: self._start_flash()
+
+    def _update_rec_box(self, rec):
+        d=self.flag_boxes.get(-3)
+        if not d: return
+        if d['rec_bar']: d['rec_bar']['value']=min(100,rec)
+        if d.get('rec_msg'):
+            bg2 = d.get('_bg_now', PNL)
+            d['rec_msg'].config(text=f'{rec:.1f}%',fg=C_REC,bg=bg2)
+
+    def _update_ready_box(self, daughter_mv, mother_mv):
+        d=self.flag_boxes.get(-1)
+        if not d or not d.get('ready_msg'): return
+
+        if self._current_disp_flag != -1:
+            self._stop_ready_flash()
+            d['ready_msg'].config(text='')
+            return
+
+        low_leaks = self._daughter_near_mother(daughter_mv, mother_mv)
+        if not self._ready_flash_active or self._ready_flash_low != low_leaks:
+            self._start_ready_flash(low_leaks)
+
+    def _update_metrics(self,v):
+        fmts={'C':'.2f','M':'.3f','J':'.5f','REC':'.1f','N':'.4f','O':'d','P':'.4f','Q':'.0f'}
+        cols={'C':FG,'M':FG,'J':DIM,'REC':C_REC,'N':C_CONC,'O':C_CONC,'P':C_CONC,'Q':C_CONC}
+        for k,fmt in fmts.items():
+            if k in self.mv and k in v:
+                try:
+                    val=v[k]; txt=(f'{int(val)}' if fmt=='d' else f'{val:{fmt}}')
+                    self.mv[k].config(text=txt,fg=cols.get(k,FG))
+                except: pass
+        if 'mother_baseline' in v:
+            try:
+                val=float(v['mother_baseline'])
+                if hasattr(self,'mb_lbl'): self.mb_lbl.config(text=f"{val:.3f} mV",fg=C_MOTHER)
+            except: pass
+        if 'daughter_baseline' in v:
+            try:
+                val=float(v['daughter_baseline'])
+                if hasattr(self,'db_lbl'): self.db_lbl.config(text=f"{val:.3f} mV",fg=C_BAS)
+            except: pass
+
+    # ── CSV ACTIONS ───────────────────────────────────────────────────────────
+    def _browse(self):
+        path=filedialog.askopenfilename(filetypes=[('CSV','*.csv'),('All','*.*')])
+        if not path: return
+        try:
+            rows=load_csv(path); self.raw_data=rows
+            name=os.path.basename(path); maxt=rows[-1][0]
+            self.lbl_info.config(text=f'{name}  ({len(rows):,} pts, {maxt:.0f} s)')
+            self.e_t1.set(str(int(np.ceil(maxt))))
+            self._reset(); self.btn_play.config(state='normal')
+            self.btn_reset.config(state='normal')
+            self._clear_log(); self._log('ready','info')
+            self._live_mode=False; self.lbl_live.config(text='')
+            self.btn_tear.config(state='normal')
+            self.btn_poweroff.config(state='normal')
+        except Exception as ex:
+            messagebox.showerror('Load Error',str(ex))
+
+    def _play(self):
+        if self.running: return
+        self._batch_calibs.clear(); self._batch_tears.clear()
+        t0=float(self.e_t0.get()); t1=float(self.e_t1.get())
+        filtered=[(t,e) for t,e in self.raw_data if t0<=t<=t1]
+        if not filtered: messagebox.showwarning('No Data','No data in window.'); return
+        self._clear_log()
+        warmup=int(self.params.get('warmup_samples',BASELINE_WARMUP_SAMPLES))
+        self._log(f'computing {len(filtered):,} samples  (warmup = {warmup*0.075:.0f} s)','info')
+        times_arr=np.array([d[0] for d in filtered]); emf_arr=np.array([d[1] for d in filtered])
+        params_sn=dict(self.params)
+        def _do_compute():
+            res=compute_all(emf_arr,params_sn); self._compute_q.put((times_arr,emf_arr,res))
+        threading.Thread(target=_do_compute,daemon=True).start()
+        self._poll_compute()
+
+    def _poll_compute(self):
+        try: times_arr,emf_arr,res=self._compute_q.get_nowait()
+        except queue.Empty: self.root.after(50,self._poll_compute); return
+        self.times=times_arr; self.emf_arr=emf_arr
+        (self.C,self.D,self.E,self.FF,self.G,self.H,self.II,
+         self.J,self.K,self.L,self.MB_arr,self.M,self.N_,self.O_,self.Pv,
+         self.Q_,self.RC_,self.OR_STATE_arr)=res
+        self._log(f'playing {len(self.times):,} samples','info')
+        self.sim_idx=0; self.running=True
+        self._last_flag=None; self._last_chart_ms=0; self._last_or_state='normal'
+        self._calib_offset=0; self._current_disp_flag=None
+        for v in self.flag_boxes: self.flag_boxes[v]['events']=0
+        self._reset_flag_boxes(); self._stop_or_flash()
+        d=self._or_box
+        d['name'].config(text='NORMAL',fg=DIM,bg=PNL); d['sub'].config(text='EMF in range',fg=DIM,bg=PNL)
+        d['frame'].config(bg=PNL); d['dot'].config(bg=PNL,fg=BRD); d['inner'].config(bg=PNL)
+        self.btn_calib.pack_forget(); self._calib_btn_visible=False
+        self.btn_play.config(state='disabled'); self.btn_pause.config(state='normal')
+        self._tick()
+
+    def _pause(self):
+        self.running=False
+        if self._after_id: self.root.after_cancel(self._after_id); self._after_id=None
+        self._stop_flash(); self._stop_or_flash(); self._stop_ready_flash()
+        self.btn_play.config(state='normal'); self.btn_pause.config(state='disabled')
+        self._log('paused','info')
+
+    def _reset(self):
+        self.running=False
+        if self._after_id: self.root.after_cancel(self._after_id); self._after_id=None
+        self._stop_flash(); self._stop_or_flash(); self._stop_ready_flash()
+        self.sim_idx=0; self._last_flag=None; self._draw_prog(0)
+        self._last_or_state='normal'; self._calib_offset=0
+        self._current_disp_flag=None
+        self.btn_play.config(state='normal' if self.raw_data else 'disabled')
+        self.btn_pause.config(state='disabled')
+        self.lbl_stats.config(text='t=--  emf=--  Δ=--  SD=--  ppm=--  rec=--%')
+        for lbl in self.mv.values(): lbl.config(text='--',fg=DIM)
+        for v in self.flag_boxes: self.flag_boxes[v]['events']=0
+        self._reset_flag_boxes()
+        d=self._or_box
+        d['name'].config(text='NORMAL',fg=DIM,bg=PNL); d['sub'].config(text='EMF in range',fg=DIM,bg=PNL)
+        d['frame'].config(bg=PNL); d['dot'].config(bg=PNL,fg=BRD); d['inner'].config(bg=PNL)
+        self.btn_calib.pack_forget(); self._calib_btn_visible=False
+        if hasattr(self,'mb_lbl'): self.mb_lbl.config(text='--',fg=DIM)
+        if hasattr(self,'db_lbl'): self.db_lbl.config(text='--',fg=DIM)
+        for ln in (self.ln_raw,self.ln_lea,self.ln_bas,self.ln_mother,
+                   self.ln_N,self.ln_P,self.ln_Q,self.ln_REC,self.ln_or_thr):
+            ln.set_data([],[])
+        for ax in (self.ax1,self.ax2): ax.relim(); ax.autoscale_view()
+        self.ax2b.relim(); self.ax2b.autoscale_view(); self.mpl.draw_idle()
+
+    def _get_disp_flag(self,raw_flag,rec):
+        if   raw_flag==-1: return -1 if rec>=100.0 else -3
+        elif raw_flag== 1: return 1
+        return -1
+
+    def _tick(self):
+        if not self.running: return
+        spd=self.spd_var.get(); step=max(1,min(int(spd*1.5),2000))
+        end=min(self.sim_idx+step,len(self.times)); self.sim_idx=end; idx=end
+        if idx<2: self._after_id=self.root.after(self.INTERVAL,self._tick); return
+
+        t=self.times[idx-1]; e=self.emf_arr[idx-1]
+        dlt=self.M[idx-1]; sd=self.J[idx-1]; ppm=self.Q_[idx-1]; rec=self.RC_[idx-1]
+        or_state=str(self.OR_STATE_arr[idx-1]) if self.OR_STATE_arr is not None else 'normal'
+        daughter_mv=float(self.L[idx-1]); mother_mv=float(self.MB_arr[idx-1])
+
+        self.lbl_stats.config(text=f't={t:.1f}s  emf={e:.2f}mV  Δ={dlt:.3f}  SD={sd:.5f}  ppm={ppm:.0f}  rec={rec:.0f}%')
+        self._draw_prog(idx/len(self.times)*100)
+        self._update_or_box(or_state,f'{t:.1f}')
+        in_or=(or_state in ('overrange','waiting_drop','stable'))
+
+        if not in_or:
+            raw_flag=float(self.II[idx-1])
+            if idx>=2 and self.II[idx-2]==1 and raw_flag==-1: disp_flag=-2
+            else: disp_flag=self._get_disp_flag(raw_flag,rec)
+
+            if disp_flag!=self._last_flag:
+                if disp_flag in self.flag_boxes: self.flag_boxes[disp_flag]['events']+=1
+                self._last_flag=disp_flag
+                self._current_disp_flag=disp_flag
+                self._highlight_flag(disp_flag)
+                lbl_map={-1:'→ AIR / BASELINE (recovered)',1:'→ H2 CONFIRMED ▲',-2:'→ H2 DOWN ▼',-3:'→ RECOVERING'}
+                tag_map={-1:'air',1:'up',-2:'dn',-3:'rec'}
+                self._log(lbl_map.get(disp_flag,f'→{disp_flag}'),tag_map.get(disp_flag,'info'),f'{t:.1f}')
+                if disp_flag==-1: self.btn_poweroff.config(state='normal')
+
+            ocap=int(self.params['o_cap'])
+            if idx>1 and self.O_[idx-1]==ocap and self.O_[idx-2]<ocap:
+                self._log(f'★ 6 s snapshot → {ppm:.0f} ppm  (P={self.Pv[idx-1]:.4f} mV)','conc',f'{t:.1f}')
+
+            if raw_flag==1:
+                d=self.flag_boxes.get(1)
+                if d and d['conc_lbl']:
+                    d['conc_lbl'].config(text=f'{ppm:.0f} ppm',
+                                          fg=C_CONC if not self._flash_active else '#ffffff')
+
+            self._update_rec_box(rec)
+            self._update_ready_box(daughter_mv, mother_mv)
+
+        self._update_metrics(dict(
+            C=self.C[idx-1],M=self.M[idx-1],J=self.J[idx-1],
+            N=self.N_[idx-1],O=self.O_[idx-1],P=self.Pv[idx-1],
+            Q=self.Q_[idx-1],REC=rec,
+            mother_baseline=mother_mv,daughter_baseline=daughter_mv))
+        s=max(0,idx-self.WIN); tl=self.times[s:idx]
+        self._update_charts(tl,self.emf_arr[s:idx],self.C[s:idx],self.L[s:idx],
+                            self.MB_arr[s:idx],self.N_[s:idx],self.Pv[s:idx],
+                            self.Q_[s:idx],self.RC_[s:idx],
+                            or_thr=float(self.params.get('or_thresh',720.0)))
+
+        if idx>=len(self.times):
+            self.running=False; self.btn_play.config(state='normal')
+            self.btn_pause.config(state='disabled'); self._draw_prog(100); self._stop_flash()
+            self._log(f'complete — {len(self.times):,} samples','info'); return
+        self._after_id=self.root.after(self.INTERVAL,self._tick)
+
+    # ── LIVE LOG ──────────────────────────────────────────────────────────────
+    def _browse_live(self):
+        path=filedialog.askopenfilename(title='Select Live Log File',
+                                         filetypes=[('Log','*.log'),('Text','*.txt'),('All','*.*')])
+        if not path: return
+        self._start_live(path)
+
+    def _start_live(self,path):
+        self._stop_live(silent=True)
+        if self.running: self._pause()
+        self._live_mode=True; self._live_state.reset()
+        self._live_calibs.clear(); self._live_tears.clear()
+        self._ic=IncrementalCompute(self.params)
+        self._live_last_flag=None; self._last_chart_ms=0
+        self._live_warmup_done=False; self._last_or_state='normal'
+        self._calib_btn_visible=False; self._current_disp_flag=None
+        for v in self.flag_boxes: self.flag_boxes[v]['events']=0
+        self._reset_flag_boxes(); self._stop_or_flash()
+        d=self._or_box
+        d['name'].config(text='NORMAL',fg=DIM,bg=PNL); d['sub'].config(text='EMF in range',fg=DIM,bg=PNL)
+        d['frame'].config(bg=PNL); d['dot'].config(bg=PNL,fg=BRD); d['inner'].config(bg=PNL)
+        self.btn_calib.pack_forget()
+        name=os.path.basename(path); self.lbl_info.config(text=f'LIVE: {name}')
+        self.lbl_live.config(text='● LIVE',fg=C_AIR)
+        self.btn_live_stop.config(state='normal')
+        self.btn_tear.config(state='normal')
+        self.btn_poweroff.config(state='normal')
+        self.btn_play.config(state='disabled')
+        self._clear_log()
+        warmup=int(self.params.get('warmup_samples',BASELINE_WARMUP_SAMPLES))
+        self._log(f'Live log loaded — warmup: first {warmup} samples ({warmup*0.075:.0f} s)','warn')
+        self._log('Do NOT introduce H2 during warm-up window.','warn')
+        if self._prev_mother_baseline is not None:
+            ts=self._memory.get('timestamp','')
+            self._log(f'Stored mother BL: {self._prev_mother_baseline:.3f} mV  [{ts[:16]}]','info')
+        self._update_prev_mother_display()
+        self._live_thread=threading.Thread(target=self._log_reader_thread,args=(path,self._live_state),daemon=True)
+        self._live_thread.start()
+        self._live_poll()
+
+    def _stop_live(self,silent=False):
+        if self._live_after: self.root.after_cancel(self._live_after); self._live_after=None
+        self._live_state.stop(); self._live_mode=False; self.lbl_live.config(text='')
+        self.btn_live_stop.config(state='disabled')
+        self._stop_flash(); self._stop_or_flash(); self._stop_ready_flash()
+        self.btn_play.config(state='normal' if self.raw_data else 'disabled')
+        if not silent: self._log('live stopped','info')
+
+    def _log_reader_thread(self,path,state):
+        try:
+            with open(path,'r',errors='replace') as f:
+                for raw_line in f:
+                    if state.should_stop(): return
+                    v=parse_log_emf(raw_line)
+                    if v is not None: state.push(v)
+                buf=''
+                while not state.should_stop():
+                    chunk=f.read(512)
+                    if not chunk: time.sleep(0.02); continue
+                    buf+=chunk; lines=buf.split('\n'); buf=lines[-1]
+                    for raw_line in lines[:-1]:
+                        v=parse_log_emf(raw_line)
+                        if v is not None: state.push(v)
+        except Exception: pass
+
+    def _live_poll(self):
+        if not self._live_mode: return
+        emf_list,new_count=self._live_state.consume()
+        warmup=int(self.params.get('warmup_samples',BASELINE_WARMUP_SAMPLES))
+
+        if new_count>0 and self._ic is not None:
+            start=len(self._ic.emf)
+            for v in emf_list[start:]: self._ic.step(v)
+
+            if not self._live_warmup_done:
+                n=len(self._ic.emf)
+                if n>=warmup or self._ic._baseline_seeded:
+                    self._live_warmup_done=True
+                    new_mother=self._ic._mother_baseline
+                    self._log(f'✓ baseline set ({warmup*0.075:.0f} s)','info')
+                    self._check_warmup_baseline(new_mother)
+                else:
+                    self._live_after=self.root.after(self.INTERVAL,self._live_poll); return
+
+            last=self._ic.last()
+            if last is None:
+                self._live_after=self.root.after(self.INTERVAL,self._live_poll); return
+
+            idx=len(self._ic.emf); t=idx*0.075; rec=last['REC']
+            or_state=last.get('OR_STATE','normal')
+            daughter_mv=last.get('daughter_baseline',0.0)
+            mother_mv=last.get('mother_baseline',0.0)
+
+            self.lbl_stats.config(text=f't={t:.1f}s  emf={self._ic.emf[-1]:.2f}mV  Δ={last["M"]:.3f}  SD={last["J"]:.5f}  ppm={last["Q"]:.0f}  rec={rec:.0f}%')
+            self._update_or_box(or_state,f'{t:.1f}')
+            in_or=(or_state in ('overrange','waiting_drop','stable'))
+
+            if not in_or:
+                raw_flag=float(last['II'])
+                if idx>=2 and self._ic.II[-2]==1 and raw_flag==-1: disp_flag=-2
+                else: disp_flag=self._get_disp_flag(raw_flag,rec)
+
+                if disp_flag!=self._live_last_flag:
+                    if disp_flag in self.flag_boxes: self.flag_boxes[disp_flag]['events']+=1
+                    self._live_last_flag=disp_flag
+                    self._current_disp_flag=disp_flag
+                    self._highlight_flag(disp_flag)
+                    lbl_map={-1:'→ AIR / BASELINE (recovered)',1:'→ H2 CONFIRMED ▲',-2:'→ H2 DOWN ▼',-3:'→ RECOVERING'}
+                    tag_map={-1:'air',1:'up',-2:'dn',-3:'rec'}
+                    self._log(lbl_map.get(disp_flag,f'→{disp_flag}'),tag_map.get(disp_flag,'info'),f'{t:.1f}')
+                    if disp_flag==-1: self.btn_poweroff.config(state='normal')
+
+                ocap=int(self.params['o_cap'])
+                if idx>1 and self._ic.O[-1]==ocap and self._ic.O[-2]<ocap:
+                    self._log(f'★ 6 s snapshot → {last["Q"]:.0f} ppm  (P={last["P"]:.4f} mV)','conc',f'{t:.1f}')
+
+                if raw_flag==1:
+                    d=self.flag_boxes.get(1)
+                    if d and d['conc_lbl']:
+                        d['conc_lbl'].config(text=f'{last["Q"]:.0f} ppm',
+                                              fg=C_CONC if not self._flash_active else '#ffffff')
+
+                self._update_rec_box(rec)
+                self._update_ready_box(daughter_mv, mother_mv)
+
+            self._update_metrics({**last,'F':last['FF'],
+                                   'mother_baseline':mother_mv,
+                                   'daughter_baseline':daughter_mv})
+
+            s=max(0,len(self._ic.Q)-self.WIN)
+            tl=np.arange(self._ic._disp_offset+s,self._ic._disp_offset+len(self._ic.Q))*0.075
+            c_len=len(self._ic.C); q_len=len(self._ic.Q)
+            c_s=max(0,c_len-(q_len-s)); mb_s=max(0,len(self._ic.MB)-(q_len-s))
+            self._update_charts(tl,self._ic.emf[-(q_len-s):],self._ic.C[c_s:],
+                                self._ic.L[s:],self._ic.MB[mb_s:],
+                                self._ic.N[s:],self._ic.P[s:],self._ic.Q[s:],self._ic.REC[s:],
+                                or_thr=float(self.params.get('or_thresh',720.0)))
+            cur=self.lbl_live.cget('text')
+            self.lbl_live.config(text='● LIVE' if '●' not in cur else '○ LIVE',fg=C_AIR)
+
+        self._live_after=self.root.after(self.INTERVAL,self._live_poll)
+
+
+if __name__=='__main__':
+    root=tk.Tk()
+    App(root)
+    root.mainloop()
