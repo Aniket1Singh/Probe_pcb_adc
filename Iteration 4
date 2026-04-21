@@ -1,0 +1,1395 @@
+/*
+ * Smart_Probe_H2_v2.cpp
+ * Created: April 2026
+ *
+ * Ported from T5 Sensor Simulator V2.7 (Python) to ATtiny3224.
+ * V2 fixes vs V1:
+ *   1. CRITICAL: Removed `or_state = OR_NORMAL` spurious reset at bottom of engine_step --
+ *      it was wiping the overrange state machine every single sample.
+ *   2. ppm lock now breaks immediately when II flips out of UP (+1),
+ *      exactly matching Python IncrementalCompute (not gated on rec_pct==100).
+ *   3. peak_M is now captured from M_prev (the M value from the sample just
+ *      before the II transition), not from M_delta at the transition sample.
+ *      This fixes recovery getting stuck at low concentrations where baseline
+ *      is very close to peak.
+ *   4. M_prev promoted from local static to engine-level state variable so
+ *      do_calibrate() can properly reset it.
+ *   5. run_mode() is now purely counter-based (no millis gating) -- one ADC
+ *      read = one engine step, every time through the loop.
+ *   6. N_accum reset logic: when II transitions from UP->anything, N_accum
+ *      is zeroed and lock is broken, matching Python exactly.
+ *
+ * V2 upper-layer additions (engine logic untouched):
+ *   A. Terminal output is gated: nothing is emitted until *start# is received.
+ *      *SET, *CAL, *TEAR, *GET PARAMS, *RF, *T commands all work in idle.
+ *   B. Calibration table is persisted to EEPROM (magic-byte guarded).
+ *      Write ordering: invalidate magic (0x00) -> write data -> commit magic
+ *      (0xA5).  A power cut at any point leaves the table either fully
+ *      committed or recognisably invalid, so defaults are always safe to
+ *      restore on next boot.  *SET CAL uses the same safe ordering.
+ *      FIX: EEPROM addresses moved to 9-82 (ATtiny3224 has only 256 bytes,
+ *      original addresses 300+ were out of range and writes silently failed).
+ *   C. Output line gains a 6th column: baseline_L in mV (float, 3 decimals).
+ *      On the single sample where warmup completes "WARMDONE" is printed
+ *      instead of the numeric baseline; every subsequent sample shows the
+ *      live baseline_L.  Counter-based engine means extra UART bytes have
+ *      zero effect on detection timing.
+ *   D. *TEAR# command: snaps baseline_L and floor_baseline to the current
+ *      C_leaky value and resets all direction/accumulator state.  Use when
+ *      noise has stuck the engine in a spurious UP cycle at low ppm.
+ *      Does NOT touch or_state, warmup state, or the calibration table.
+ *
+ * Output columns (UART, space-separated, CR+LF):
+ * [1] raw_emf_mV   -- sensor_final_output in mV  (e.g. 0012.345)
+ * [2] ref_delta_mV -- emf minus reference        (e.g. +0000.123)
+ * [3] ppm          -- H2 concentration           (e.g. 0 to 999999)
+ * [4] flag         -- AIR/UP/DOWN/REC/OVERRANGE/WAIT/STABLE
+ * [5] recovery_pct -- 0 to 100 (integer %)
+ * [6] baseline_mV  -- current baseline_L in mV (or "WARMDONE" once)
+ *
+ * Serial command interface (9600 baud, framed *..#):
+ * *start#                    -- begin continuous output (idle -> running)
+ * *TEAR#                     -- snap baseline to current leaky value, reset state
+ * *RF<7-digit mV>#           -- set reference
+ * *T<4-digit limit><2-digit offset>#  -- set filter limit+offset
+ * *CAL#                      -- trigger calibrate (master reset)
+ * *SET JMP <float>#          -- leaky snap threshold mV
+ * *SET ALP <float>#          -- leaky blend alpha
+ * *SET UPG <float>#          -- up gate count
+ * *SET ING <float>#          -- up intensity gate
+ * *SET DNG <float>#          -- down gate count
+ * *SET DNI <float>#          -- down intensity
+ * *SET REC <float>#          -- recovery threshold
+ * *SET DRF <float>#          -- baseline drift cap mV
+ * *SET NTH <float>#          -- N accumulation threshold fraction
+ * *SET OCP <int>#            -- ROC cap (o_cap)
+ * *SET RZP <float>#          -- recovery zero percent
+ * *SET WRM <int>#            -- warmup samples
+ * *SET ORT <float>#          -- overrange entry mV
+ * *SET ORX <float>#          -- overrange exit mV
+ * *SET ORS <float>#          -- overrange stable SD threshold
+ * *SET CAL <idx> <mV> <ppm># -- edit calibration table (persists to EEPROM)
+ * *GET PARAMS#               -- print all params + calibration table
+ */
+
+/* ------------------------------------------------------------------ */
+/*  COMPILER / HARDWARE SETUP                                          */
+/* ------------------------------------------------------------------ */
+#define F_CPU  3333333UL
+#define USART1_BAUD_RATE(B) ((float)(F_CPU * 64 / (16 *(float)(B))) + 0.5)
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
+#include <avr/sleep.h>
+#include <avr/pgmspace.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* ------------------------------------------------------------------ */
+/*  I2C / ADS122C04 definitions                                        */
+/* ------------------------------------------------------------------ */
+#define I2C_TIMEOUT 10000
+#define I2C_SCL   (1<<0)
+#define I2C_SDA   (1<<1)
+#define I2C_STATE_IS_HIGH(x) ((TWI0.MSTATUS & (x)) == (x))
+#define I2C_STATE_IS_LOW(x)  ((TWI0.MSTATUS & (x)) != (x))
+#define I2C_BUS_STATE        (TWI0.MSTATUS & TWI_BUSSTATE_gm)
+#define I2C_BUS_NOT_IDLE  I2C_STATE_IS_LOW(TWI_BUSSTATE_IDLE_gc)
+#define I2C_BUS_IDLE      I2C_STATE_IS_HIGH(TWI_BUSSTATE_IDLE_gc)
+#define I2C_BUS_NOT_BUSY  I2C_STATE_IS_LOW(TWI_BUSSTATE_BUSY_gc)
+#define I2C_BUS_BUSY      I2C_STATE_IS_HIGH(TWI_BUSSTATE_BUSY_gc)
+#define I2C_BUS_NOT_OWNER I2C_STATE_IS_LOW(TWI_BUSSTATE_OWNER_gc)
+#define I2C_BUS_OWNER     I2C_STATE_IS_HIGH(TWI_BUSSTATE_OWNER_gc)
+#define I2C_NOT_CLOCKHOLD I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)
+#define I2C_CLOCKHOLD     I2C_STATE_IS_HIGH(TWI_CLKHOLD_bm)
+#define I2C_NOT_BUSERR    I2C_STATE_IS_LOW(TWI_BUSERR_bm)
+#define I2C_BUSERR        I2C_STATE_IS_HIGH(TWI_BUSERR_bm)
+#define I2C_NOT_ARBLOST   I2C_STATE_IS_LOW(TWI_ARBLOST_bm)
+#define I2C_ARBLOST       I2C_STATE_IS_HIGH(TWI_ARBLOST_bm)
+#define TWI0_BAUD(F_SCL, T_RISE) ((((((float)F_CPU / (float)F_SCL)) - 10 - ((float)F_CPU * T_RISE / 1000000))) / 2)
+#define I2C_READ  0x01
+#define I2C_WRITE 0x00
+#define I2C_WAIT_TIMEOUT  512
+#define RETURN_OK          0
+#define RETURN_FAILED      1
+#define RETURN_NO_SLAVE    2
+#define RETURN_BUS_ERROR   3
+#define RETURN_BUS_ARBLOST 4
+#define RETURN_BUS_BUSY    5
+
+#define ADS122C04_ADDR               0x80
+#define ADS122C04_CONVERSION_TIMEOUT 75
+#define ADS122C04_RESET_CMD     0x06
+#define ADS122C04_START_CMD     0x08
+#define ADS122C04_POWERDOWN_CMD 0x02
+#define ADS122C04_RDATA_CMD     0x10
+#define ADS122C04_RREG_CMD      0x20
+#define ADS122C04_WREG_CMD      0x40
+#define ADS122C04_WRITE_CMD(reg) (ADS122C04_WREG_CMD | (reg << 2))
+#define ADS122C04_READ_CMD(reg)  (ADS122C04_RREG_CMD | (reg << 2))
+#define ADS122C04_CONFIG_0_REG  0
+#define ADS122C04_CONFIG_1_REG  1
+#define ADS122C04_CONFIG_2_REG  2
+#define ADS122C04_CONFIG_3_REG  3
+#define ADS122C04_MUX_AIN1_AIN0  0x3
+#define ADS122C04_GAIN_1    0x0
+#define ADS122C04_PGA_DISABLED  0x1
+#define ADS122C04_DATA_RATE_20SPS    0x0
+#define ADS122C04_DATA_RATE_45SPS    0x1
+#define ADS122C04_DATA_RATE_90SPS    0x2
+#define ADS122C04_DATA_RATE_175SPS   0x3
+#define ADS122C04_DATA_RATE_330SPS   0x4
+#define ADS122C04_DATA_RATE_600SPS   0x5
+#define ADS122C04_DATA_RATE_1000SPS  0x6
+#define ADS122C04_OP_MODE_NORMAL    0x0
+#define ADS122C04_CONVERSION_MODE_SINGLE_SHOT  0x0
+#define ADS122C04_VREF_INTERNAL      0x0
+#define ADS122C04_TEMP_SENSOR_OFF  0x0
+#define ADS122C04_DCNT_DISABLE  0x0
+#define ADS122C04_CRC_DISABLED      0x0
+#define ADS122C04_BURN_OUT_CURRENT_OFF  0x0
+#define ADS122C04_IDAC_CURRENT_OFF     0x0
+#define ADS122C04_IDAC1_DISABLED  0x0
+#define ADS122C04_IDAC2_DISABLED  0x0
+#define ADC_RESET PIN7_bm
+
+/* ------------------------------------------------------------------ */
+/*  ADS122C04 register structs                                         */
+/* ------------------------------------------------------------------ */
+struct CONFIG_REG_0 { uint8_t PGA_BYPASS:1; uint8_t GAIN:3; uint8_t MUX:4; };
+union  CONFIG_REG_0_U { uint8_t all; struct CONFIG_REG_0 bit; };
+struct CONFIG_REG_1 { uint8_t TS:1; uint8_t VVREF:2; uint8_t CMBIT:1; uint8_t MODE:1; uint8_t DR:3; };
+union  CONFIG_REG_1_U { uint8_t all; struct CONFIG_REG_1 bit; };
+struct CONFIG_REG_2 { uint8_t IDAC:3; uint8_t BCS:1; uint8_t CRCbits:2; uint8_t DCNT:1; uint8_t DRDY:1; };
+union  CONFIG_REG_2_U { uint8_t all; struct CONFIG_REG_2 bit; };
+struct CONFIG_REG_3 { uint8_t RESERVED:2; uint8_t I2MUX:3; uint8_t I1MUX:3; };
+union  CONFIG_REG_3_U { uint8_t all; struct CONFIG_REG_3 bit; };
+typedef struct ADS122C04Reg {
+    union CONFIG_REG_0_U reg0;
+    union CONFIG_REG_1_U reg1;
+    union CONFIG_REG_2_U reg2;
+    union CONFIG_REG_3_U reg3;
+} ADS122C04Reg_t;
+ADS122C04Reg_t ADS122C04_Reg;
+union raw_voltage_union { int32_t INT32; uint32_t UINT32; };
+uint8_t _wireMode = 0x4;
+
+/* ------------------------------------------------------------------ */
+/*  GLOBAL HARDWARE STATE                                              */
+/* ------------------------------------------------------------------ */
+volatile uint32_t millis_count = 0;
+uint8_t  diag_dr   = 0;
+uint8_t  diag_pga  = 0;
+uint8_t  diag_gain = 0;
+uint16_t inter_sample_ms = 50;
+uint16_t drdy_timeout_ms = 75;
+uint8_t  memdata;
+
+float sensor_final_output = 0.0f;
+float pub_adc_value       = 0.0f;
+float diff_adc_value      = 0.0f;
+
+long long int Reference_Set_Value = 0;
+unsigned int  limit        = 0;
+unsigned char offset_value = 30;
+
+/* ------------------------------------------------------------------ */
+/*  UART RX BUFFER                                                     */
+/* ------------------------------------------------------------------ */
+#define CMD_BUF_LEN 64
+volatile unsigned char company[CMD_BUF_LEN];
+volatile uint8_t       rxcntr    = 0;
+volatile uint8_t       strt      = 0;
+volatile bool          cmd_ready = false;
+
+/* ------------------------------------------------------------------ */
+/*  RUN-GATE STATE  (Addition A)                                       */
+/* ------------------------------------------------------------------ */
+static bool is_running = false;   /* false = IDLE, true = running */
+
+/* ------------------------------------------------------------------ */
+/*  DETECTION ENGINE PARAMETERS                                        */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    float    jmp;
+    float    alp;
+    float    upG;
+    float    inG;
+    float    dnG;
+    float    dnI;
+    float    rec;
+    float    drf;
+    float    n_thresh;
+    uint16_t o_cap;
+    float    rec_zero_pct;
+    uint16_t warmup;
+    float    or_thresh;
+    float    or_exit_mv;
+    float    or_sd_stable;
+} Params;
+
+static Params P = {
+    .jmp          = 0.1f,
+    .alp          = 0.1f,
+    .upG          = 6.0f,
+    .inG          = 0.1f,
+    .dnG          = 6.0f,
+    .dnI          = -0.1f,
+    .rec          = 0.8f,
+    .drf          = 20.0f,
+    .n_thresh     = 0.0033f,
+    .o_cap        = 80,
+    .rec_zero_pct = 0.05f,
+    .warmup       = 400,
+    .or_thresh    = 720.0f,
+    .or_exit_mv   = 20.0f,
+    .or_sd_stable = 0.000020f,
+};
+
+/* ------------------------------------------------------------------ */
+/*  RAMP TABLES                                                        */
+/* ------------------------------------------------------------------ */
+typedef struct { float key; float val; } RampEntry;
+
+static const RampEntry RAMP_UP[] = {
+    {-100.0f, 0.0001f}, {40.0f, 0.1f}, {200.0f, 0.1f}, {400.0f, 0.1f},
+};
+#define RAMP_UP_N  4
+
+static const RampEntry RAMP_DN[] = {
+    {-100.0f, -0.00001f}, {40.0f, -0.1f}, {200.0f, -0.2f}, {400.0f, -1.0f},
+};
+#define RAMP_DN_N  4
+
+static const RampEntry STAB_REC[] = {
+    {0.0f, 1.00f}, {0.00001f, 1.00f}, {0.001f, 1.00f}, {0.01f,  0.90f},
+    {0.1f, 0.85f}, {0.25f,   0.67f}, {0.5f,   0.50f}, {0.8f,   0.25f},
+};
+#define STAB_REC_N  8
+
+/* ================================================================== */
+/*  CALIBRATION TABLE  (Addition B)                                    */
+/*                                                                     */
+/*  EEPROM map:                                                        */
+/*    ATtiny3224 has 256 bytes EEPROM (0x00-0xFF).                    */
+/*    Existing usage: 6-8 (limit), 150-152 (offset), 220-222 (ref).  */
+/*    Calib layout:                                                    */
+/*      byte  9      : magic  0xA5 = table committed and valid        */
+/*      bytes 10-81  : 9 entries x 8 bytes each                       */
+/*                       bytes 0-3: float p_mv  (IEEE-754 LE)         */
+/*                       bytes 4-7: long  ppm   (32-bit LE)           */
+/*                                                                     */
+/*  NOTE: Original code used addresses 300/301 which are BEYOND the   */
+/*  256-byte EEPROM limit. Writes silently failed, so calibration was  */
+/*  never saved. Fixed to addresses 9/10 which are safe and unused.   */
+/*                                                                     */
+/*  Safe write ordering used throughout:                               */
+/*    1. Write 0x00 to magic address  (invalidates table)             */
+/*    2. Write all data bytes                                          */
+/*    3. Write 0xA5 to magic address  (commits table)                 */
+/* ================================================================== */
+typedef struct { float p_mv; long ppm; } CalibEntry;
+
+static const CalibEntry CALIB_DEFAULT[9] = {
+    {  0.00f,      0},
+    {  0.12f,      5},
+    {  0.30f,     10},
+    {  4.20f,    100},
+    { 60.00f,   1000},
+    {260.00f,   5000},
+    {368.00f,  10000},
+    {430.00f,  20000},
+    {720.00f, 100000},
+};
+#define CALIB_N  9
+
+static CalibEntry CALIB[CALIB_N];  /* live RAM table loaded from EEPROM at boot */
+
+/* ------------------------------------------------------------------ */
+/*  FIX: addresses moved from 300/301 to 9/10 to stay within the      */
+/*  ATtiny3224's 256-byte EEPROM (0x00-0xFF).                         */
+/*  Layout: magic(9) + data(10..81) = 73 bytes, no overlap with       */
+/*  existing limit(6-8) / offset(150-152) / reference(220-222).       */
+/* ------------------------------------------------------------------ */
+#define CALIB_EE_MAGIC_ADDR   9u
+#define CALIB_EE_DATA_ADDR   10u
+#define CALIB_EE_MAGIC_VAL   0xA5u
+#define CALIB_EE_MAGIC_INVAL 0x00u
+
+/* ------------------------------------------------------------------ */
+/*  Low-level EEPROM primitives                                        */
+/* ------------------------------------------------------------------ */
+static void ee_wb(uint16_t addr, uint8_t val) {
+    eeprom_write_byte((uint8_t*)(uintptr_t)addr, val);
+    while (!eeprom_is_ready()) {}
+}
+static uint8_t ee_rb(uint16_t addr) {
+    return eeprom_read_byte((uint8_t*)(uintptr_t)addr);
+}
+
+static void ee_write_float(uint16_t addr, float v) {
+    uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) ee_wb((uint16_t)(addr + i), b[i]);
+}
+static float ee_read_float(uint16_t addr) {
+    float v; uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) b[i] = ee_rb((uint16_t)(addr + i));
+    return v;
+}
+static void ee_write_long(uint16_t addr, long v) {
+    uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) ee_wb((uint16_t)(addr + i), b[i]);
+}
+static long ee_read_long(uint16_t addr) {
+    long v; uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) b[i] = ee_rb((uint16_t)(addr + i));
+    return v;
+}
+
+/*
+ * calib_ee_save_all -- write entire CALIB[] to EEPROM using safe ordering.
+ * Step 1: invalidate magic.
+ * Step 2: write all 9 entries.
+ * Step 3: commit magic.
+ */
+static void calib_ee_save_all(void) {
+    ee_wb(CALIB_EE_MAGIC_ADDR, CALIB_EE_MAGIC_INVAL);          /* step 1 */
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        uint16_t base = (uint16_t)(CALIB_EE_DATA_ADDR + (uint16_t)i * 8u);
+        ee_write_float(base,                  CALIB[i].p_mv);  /* step 2 */
+        ee_write_long ((uint16_t)(base + 4u), CALIB[i].ppm);
+    }
+    ee_wb(CALIB_EE_MAGIC_ADDR, CALIB_EE_MAGIC_VAL);            /* step 3 */
+}
+
+/*
+ * calib_ee_save_entry -- write one entry using safe ordering.
+ * Invalidate -> write entry -> recommit magic.
+ */
+static void calib_ee_save_entry(uint8_t idx) {
+    ee_wb(CALIB_EE_MAGIC_ADDR, CALIB_EE_MAGIC_INVAL);           /* step 1 */
+    uint16_t base = (uint16_t)(CALIB_EE_DATA_ADDR + (uint16_t)idx * 8u);
+    ee_write_float(base,                  CALIB[idx].p_mv);     /* step 2 */
+    ee_write_long ((uint16_t)(base + 4u), CALIB[idx].ppm);
+    ee_wb(CALIB_EE_MAGIC_ADDR, CALIB_EE_MAGIC_VAL);             /* step 3 */
+}
+
+/*
+ * calib_ee_load -- called once from main() before sei().
+ * If magic != 0xA5 (first boot or corrupt): copy defaults to RAM and EEPROM.
+ * Otherwise: read saved table into RAM.
+ */
+static void calib_ee_load(void) {
+    if (ee_rb(CALIB_EE_MAGIC_ADDR) != CALIB_EE_MAGIC_VAL) {
+        for (uint8_t i = 0; i < CALIB_N; i++) CALIB[i] = CALIB_DEFAULT[i];
+        calib_ee_save_all();
+    } else {
+        for (uint8_t i = 0; i < CALIB_N; i++) {
+            uint16_t base = (uint16_t)(CALIB_EE_DATA_ADDR + (uint16_t)i * 8u);
+            CALIB[i].p_mv = ee_read_float(base);
+            CALIB[i].ppm  = ee_read_long ((uint16_t)(base + 4u));
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  TABLE LOOKUP HELPERS                                               */
+/* ------------------------------------------------------------------ */
+static float vlu(float v, const RampEntry *tbl, uint8_t n) {
+    float r = tbl[0].val;
+    for (uint8_t i = 0; i < n; i++) {
+        if (v >= tbl[i].key) r = tbl[i].val; else break;
+    }
+    return r;
+}
+
+static float vlu_sd(float v, const RampEntry *tbl, uint8_t n) {
+    float r = tbl[0].val;
+    for (uint8_t i = 0; i < n; i++) { if (v >= tbl[i].key) r = tbl[i].val; }
+    return r;
+}
+
+static long calib_interp(float p_val) {
+    if (p_val <= CALIB[0].p_mv)         return CALIB[0].ppm;
+    if (p_val >= CALIB[CALIB_N-1].p_mv) return CALIB[CALIB_N-1].ppm;
+    for (uint8_t i = 0; i < CALIB_N - 1; i++) {
+        float x0 = CALIB[i].p_mv,   x1 = CALIB[i+1].p_mv;
+        long  y0 = CALIB[i].ppm,    y1 = CALIB[i+1].ppm;
+        if (p_val >= x0 && p_val <= x1) {
+            float t = (p_val - x0) / (x1 - x0);
+            return (long)(y0 + t * (float)(y1 - y0) + 0.5f);
+        }
+    }
+    return CALIB[CALIB_N-1].ppm;
+}
+
+/* ================================================================== */
+/*  INCREMENTAL DETECTION ENGINE STATE                                 */
+/* ================================================================== */
+#define SD_WIN 6
+static float   sd_buf[SD_WIN];
+static uint8_t sd_idx = 0;
+
+static float sd_push(float v) {
+    sd_buf[sd_idx] = v;
+    sd_idx = (sd_idx + 1) % SD_WIN;
+    float sum = 0.0f, var = 0.0f;
+    for (uint8_t i = 0; i < SD_WIN; i++) sum += sd_buf[i];
+    float mean = sum / SD_WIN;
+    for (uint8_t i = 0; i < SD_WIN; i++) { float d = sd_buf[i]-mean; var += d*d; }
+    return sqrtf(var / SD_WIN);
+}
+
+#define C_WIN 7
+static float   c_buf[C_WIN];
+static uint8_t c_buf_idx    = 0;
+static uint8_t c_buf_filled = 0;
+
+static void c_push(float v) {
+    c_buf[c_buf_idx] = v;
+    c_buf_idx = (c_buf_idx + 1) % C_WIN;
+    if (c_buf_filled < C_WIN) c_buf_filled++;
+}
+
+static float c_get_back(uint8_t k) {
+    int idx = (int)c_buf_idx - 1 - (int)k;
+    while (idx < 0) idx += C_WIN;
+    return c_buf[idx];
+}
+
+static uint32_t sample_count   = 0;
+static float    C_leaky         = 0.0f;
+static float    baseline_L      = 0.0f;
+static float    floor_baseline  = 0.0f;
+static bool     baseline_seeded = false;
+
+static uint16_t cnt_D  = 0;
+static float    acc_E  = 0.0f;
+static uint16_t cnt_F  = 0;
+static float    acc_G  = 0.0f;
+
+static float    II      = -1.0f;
+static float    II_prev = -1.0f;
+
+static float    N_accum    = 0.0f;
+static uint16_t O_roc      = 0;
+static float    P_clip     = 0.0f;
+
+static long     Q_ppm      = 0;
+static bool     ppm_locked = false;
+static long     locked_ppm = 0;
+
+static float    peak_M  = 0.0f;
+static float    rec_pct = 100.0f;
+static float    M_prev  = 0.0f;
+
+#define WARMUP_ACC_MAX 400
+static float    warmup_acc[WARMUP_ACC_MAX];
+static uint16_t warmup_acc_n = 0;
+
+static bool warmup_just_done = false;  /* Addition C: one-shot WARMDONE flag */
+
+typedef enum { OR_NORMAL=0, OR_OVERRANGE, OR_WAIT_DROP, OR_STABLE } OrState;
+static OrState or_state = OR_NORMAL;
+
+typedef enum { FLAG_AIR=0, FLAG_UP, FLAG_DOWN, FLAG_REC,
+               FLAG_OVERRANGE, FLAG_WAIT, FLAG_STABLE } FlagState;
+static FlagState disp_flag = FLAG_AIR;
+
+/* ------------------------------------------------------------------ */
+/*  Forward declarations                                               */
+/* ------------------------------------------------------------------ */
+void USART1_sendChar(char c);
+void USART1_sendStr(const char *s);
+void USART1_sendFloat(float v, uint8_t decimals);
+void USART1_sendLong(long v);
+void USART1_sendUInt(uint32_t v);
+void tx_newline(void);
+
+/* ================================================================== */
+/*  WARMUP MEAN                                                        */
+/* ================================================================== */
+static float warmup_mean(void) {
+    float s = 0.0f;
+    for (uint16_t i = 0; i < warmup_acc_n; i++) s += warmup_acc[i];
+    return (warmup_acc_n > 0) ? s / warmup_acc_n : 0.0f;
+}
+
+/* ================================================================== */
+/*  CALIBRATE -- Master Reset                                          */
+/* ================================================================== */
+static void do_calibrate(void) {
+    float new_base  = C_leaky;
+    baseline_L      = new_base;
+    floor_baseline  = new_base;
+    baseline_seeded = true;
+
+    peak_M     = 0.0f;
+    M_prev     = 0.0f;
+    ppm_locked = false;
+    locked_ppm = 0;
+
+    cnt_D = 0;  acc_E = 0.0f;
+    cnt_F = 0;  acc_G = 0.0f;
+    II      = -1.0f;
+    II_prev = -1.0f;
+    N_accum = 0.0f;
+    O_roc   = 0;
+    P_clip  = 0.0f;
+    Q_ppm   = 0;
+    rec_pct = 100.0f;
+
+    warmup_just_done = false;
+    disp_flag = FLAG_AIR;
+
+    USART1_sendStr("OK_CAL\r\n");
+}
+
+/* ================================================================== */
+/*  TEAR -- Baseline snap  (Addition D)                                */
+/* ================================================================== */
+static void do_tear(void) {
+    baseline_L      = C_leaky;
+    floor_baseline  = C_leaky;
+    baseline_seeded = true;
+
+    peak_M     = 0.0f;
+    M_prev     = 0.0f;
+    ppm_locked = false;
+    locked_ppm = 0;
+
+    cnt_D = 0;  acc_E = 0.0f;
+    cnt_F = 0;  acc_G = 0.0f;
+    II      = -1.0f;
+    II_prev = -1.0f;
+    N_accum = 0.0f;
+    O_roc   = 0;
+    P_clip  = 0.0f;
+    Q_ppm   = 0;
+    rec_pct = 100.0f;
+    disp_flag = FLAG_AIR;
+
+    USART1_sendStr("OK_TEAR\r\n");
+}
+
+/* ================================================================== */
+/*  DETECTION ENGINE -- one sample step                                */
+/* ================================================================== */
+static void engine_step(float emf_mv) {
+    sample_count++;
+
+    float C_prev = C_leaky;
+    if (sample_count == 1) {
+        C_leaky = emf_mv;
+        for (uint8_t i = 0; i < SD_WIN; i++) sd_buf[i] = emf_mv;
+        for (uint8_t i = 0; i < C_WIN;  i++) c_buf[i]  = emf_mv;
+        c_buf_filled = C_WIN;
+        if (!baseline_seeded) {
+            baseline_L     = emf_mv;
+            floor_baseline = emf_mv;
+        }
+        M_prev  = 0.0f;
+        II_prev = II;
+        return;
+    }
+
+    /* Leaky integrator */
+    if (fabsf(emf_mv - C_prev) > P.jmp)
+        C_leaky = emf_mv;
+    else
+        C_leaky = (emf_mv - C_prev) * P.alp + C_prev;
+
+    c_push(C_leaky);
+    float J_sd = sd_push(C_leaky);
+
+    /* Overrange state machine */
+    switch (or_state) {
+        case OR_NORMAL:
+            if (emf_mv > P.or_thresh)  or_state = OR_OVERRANGE;
+            break;
+        case OR_OVERRANGE:
+            if (emf_mv < P.or_exit_mv) or_state = OR_WAIT_DROP;
+            break;
+        case OR_WAIT_DROP:
+            if (emf_mv > P.or_thresh)  { or_state = OR_OVERRANGE; break; }
+            if (J_sd < P.or_sd_stable && emf_mv < P.or_exit_mv)
+                                        or_state = OR_STABLE;
+            break;
+        case OR_STABLE:
+            if (emf_mv > P.or_thresh)  or_state = OR_OVERRANGE;
+            break;
+    }
+
+    bool in_or = (or_state != OR_NORMAL);
+
+    /* Warmup baseline seeding */
+    if (!baseline_seeded) {
+        if (warmup_acc_n < P.warmup && warmup_acc_n < WARMUP_ACC_MAX)
+            warmup_acc[warmup_acc_n++] = C_leaky;
+
+        if (sample_count == (uint32_t)P.warmup) {
+            float seed     = warmup_mean();
+            baseline_L     = seed;
+            floor_baseline = seed;
+            baseline_seeded  = true;
+            warmup_just_done = true;   /* Addition C */
+        }
+    }
+
+    bool in_warmup = (!baseline_seeded);
+
+    /* Gate: skip H2 logic during overrange / first 8 samples */
+    if (in_or || sample_count < 8) {
+        switch (or_state) {
+            case OR_OVERRANGE: disp_flag = FLAG_OVERRANGE; break;
+            case OR_WAIT_DROP: disp_flag = FLAG_WAIT;      break;
+            case OR_STABLE:    disp_flag = FLAG_STABLE;    break;
+            default: break;
+        }
+        II_prev = II;
+        return;
+    }
+
+    /* Ring buffer lookbacks */
+    float c6  = (c_buf_filled >= 7) ? c_get_back(6) : c_get_back(c_buf_filled - 1);
+    float cp1 = c_get_back(1);
+
+    /* D/E up counters */
+    float ru_thresh = vlu(C_leaky, RAMP_UP, RAMP_UP_N);
+    if ((C_leaky - cp1) > ru_thresh) { cnt_D++; acc_E += (C_leaky - c6); }
+    else                             { cnt_D = 0; acc_E = 0.0f; }
+
+    /* F/G down counters */
+    float rd_thresh = vlu(C_leaky, RAMP_DN, RAMP_DN_N);
+    if ((C_leaky - c6) < rd_thresh) { cnt_F++; acc_G += (C_leaky - c6); }
+    else                            { cnt_F = 0; acc_G = 0.0f; }
+
+    /* Direction vote */
+    int8_t h = 0;
+    if ((float)cnt_D > P.upG && acc_E > P.inG) h += 1;
+    if ((float)cnt_F > P.dnG && acc_G < P.dnI) h -= 1;
+
+    II_prev = II;
+    if (h != 0) II = (float)h;
+
+    /* Stability / recovery factor K */
+    float K = 0.0f;
+    if (!in_warmup && II != 1.0f)
+        K = vlu_sd(J_sd, STAB_REC, STAB_REC_N);
+
+    /* Baseline update (downward ratchet + upward drift cap) */
+    if (!in_warmup) {
+        if (C_leaky < floor_baseline) {
+            floor_baseline = C_leaky;
+            baseline_L     = C_leaky;
+        } else {
+            if (K >= P.rec && fabsf(C_leaky - floor_baseline) < P.drf)
+                baseline_L = C_leaky;
+        }
+    }
+
+    float M_delta = C_leaky - baseline_L;
+
+    /* Peak capture at UP->DOWN edge (M_prev, not M_delta) */
+    if (II == -1.0f && II_prev == 1.0f)
+        peak_M = fabsf(M_prev);
+
+    /* Recovery % */
+    if (II == -1.0f && peak_M > 0.0f) {
+        float abs_m = fabsf(M_delta);
+        if (abs_m < P.rec_zero_pct * peak_M) {
+            rec_pct = 100.0f;
+        } else {
+            float r = (1.0f - abs_m / peak_M) * 100.0f;
+            if (r < 0.0f)  r = 0.0f;
+            if (r > 99.9f) r = 99.9f;
+            rec_pct = r;
+        }
+    } else if (II == 1.0f) {
+        rec_pct = 0.0f;
+    }
+
+    /* N accumulator & ppm lock */
+    if (II == 1.0f && II_prev == -1.0f) {
+        N_accum    = M_delta;
+        ppm_locked = false;
+        locked_ppm = 0;
+    } else if (II == 1.0f) {
+        float delta_m = M_delta - M_prev;
+        if (M_delta > 0.0f && delta_m > P.n_thresh * M_delta)
+            N_accum += delta_m;
+    } else {
+        N_accum    = 0.0f;
+        ppm_locked = false;
+        locked_ppm = 0;
+    }
+
+    /* ROC counter O */
+    uint16_t O_prev = O_roc;
+    if (II > 0.0f)
+        O_roc = (O_prev >= P.o_cap) ? P.o_cap : O_prev + 1;
+    else
+        O_roc = 0;
+
+    /* P clip & lock */
+    if (O_roc == O_prev) {
+        /* unchanged */
+    } else if (O_roc == P.o_cap) {
+        P_clip = N_accum;
+    } else {
+        P_clip = 0.0f;
+    }
+
+    if (O_roc == P.o_cap && O_prev < P.o_cap) {
+        ppm_locked = true;
+        locked_ppm = calib_interp(P_clip);
+    }
+
+    /* Q ppm output */
+    if (ppm_locked) {
+        Q_ppm = locked_ppm;
+    } else {
+        float q_src = (O_roc >= P.o_cap) ? P_clip : N_accum;
+        Q_ppm = calib_interp(q_src);
+    }
+
+    /* Display flag */
+    if      (II == 1.0f)                        disp_flag = FLAG_UP;
+    else if (II == -1.0f && II_prev == 1.0f)    disp_flag = FLAG_DOWN;
+    else if (II == -1.0f && rec_pct >= 100.0f)  disp_flag = FLAG_AIR;
+    else if (II == -1.0f && rec_pct <  100.0f)  disp_flag = FLAG_REC;
+    else                                        disp_flag = FLAG_AIR;
+
+    /* Advance M_prev */
+    M_prev = M_delta;
+}
+
+/* ================================================================== */
+/*  I2C DRIVER                                                         */
+/* ================================================================== */
+bool I2C_RawStart(uint8_t deviceAddr, uint8_t Direction) {
+    volatile uint16_t timeout;
+    deviceAddr = deviceAddr | Direction;
+    if (I2C_BUS_NOT_BUSY) {
+        for (volatile uint16_t arbLoop = 0x04; arbLoop > 0; arbLoop--) {
+            TWI0.MADDR = deviceAddr;
+            if (Direction)
+            { for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_RIF_bm) && (timeout > 0); timeout--){} }
+            else
+            { for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_WIF_bm) && (timeout > 0); timeout--){} }
+            if (I2C_ARBLOST) continue;
+            if (I2C_BUSERR)  return(RETURN_BUS_ERROR);
+            if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) return(RETURN_OK);
+            else                                return(RETURN_NO_SLAVE);
+        }
+    } else return(RETURN_BUS_BUSY);
+    return(RETURN_BUS_ARBLOST);
+}
+
+bool I2C_RawStop(void) {
+    volatile uint16_t timeout;
+    for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--){}
+    if (timeout == 0) return(RETURN_FAILED);
+    TWI0.MCTRLB = TWI_ACKACT_NACK_gc | TWI_MCMD_STOP_gc;
+    for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--){}
+    if (I2C_BUSERR) TWI0.MSTATUS = TWI_BUSERR_bm;
+    return(RETURN_OK);
+}
+
+void I2C_RawForceStop(void) {
+    I2C_RawStop();
+    TWI0.MSTATUS |= TWI_BUSSTATE_IDLE_gc;
+    TWI0.MCTRLB  |= TWI_FLUSH_bm;
+}
+
+bool I2C_RawWrite(uint8_t write_data) {
+    volatile uint16_t timeout;
+    if (I2C_BUS_OWNER) {
+        for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--){}
+        if (timeout == 0) return(RETURN_FAILED);
+        TWI0.MDATA = write_data;
+        for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_WIF_bm) && (timeout > 0); timeout--){}
+        if (I2C_BUSERR) return(RETURN_BUS_ERROR);
+        if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) return(RETURN_OK);
+        else return(RETURN_NO_SLAVE);
+    }
+    return(RETURN_FAILED);
+}
+
+bool I2C_RawRead(uint8_t ACK) {
+    volatile uint16_t timeout;
+    if (I2C_BUS_OWNER) {
+        for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm) && (timeout > 0); timeout--){}
+        if (timeout == 0) return(RETURN_FAILED);
+        if (ACK == 1) TWI0.MCTRLB &= ~(1 << TWI_ACKACT_bp);
+        else          TWI0.MCTRLB |=  (1 << TWI_ACKACT_bp);
+        for (timeout = I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_RIF_bm) && (timeout > 0); timeout--){}
+        if (timeout == 0) return(RETURN_FAILED);
+        memdata = TWI0.MDATA;
+        if (I2C_BUSERR) return(RETURN_FAILED);
+        if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) return(RETURN_OK);
+        else return(RETURN_FAILED);
+    }
+    return(RETURN_FAILED);
+}
+
+void I2C_StartMaster(void) {
+    PORTB.DIRSET = I2C_SCL;
+    PORTB.DIRSET = I2C_SDA;
+    TWI0.CTRLA   = TWI_SDAHOLD_500NS_gc | TWI_SDASETUP_8CYC_gc;
+    TWI0.MBAUD   = (uint8_t)TWI0_BAUD(100000, 1000);
+    TWI0.MCTRLA  = 1 << TWI_ENABLE_bp | 0 << TWI_QCEN_bp | 0 << TWI_RIEN_bp
+                 | 1 << TWI_SMEN_bp | TWI_TIMEOUT_DISABLED_gc | 0 << TWI_WIEN_bp;
+    TWI0.MSTATUS = TWI_BUSSTATE_IDLE_gc;
+    TWI0.MSTATUS = (TWI_RIF_bm | TWI_WIF_bm);
+    TWI0.MCTRLB  = TWI_FLUSH_bm;
+}
+void InitI2C(void) { I2C_StartMaster(); }
+
+bool start_transmission(char device_address) { return(I2C_RawStart(device_address, I2C_WRITE)); }
+bool stop_transmission(void)                 { return(I2C_RawStop()); }
+void write_on_bus(unsigned char ch)          { I2C_RawWrite(ch); }
+
+void ADS122C04_sendCommand(uint8_t command) {
+    start_transmission(ADS122C04_ADDR); write_on_bus(command); stop_transmission();
+}
+void start(void)         { ADS122C04_sendCommand(ADS122C04_START_CMD);     }
+void reset(void)         { ADS122C04_sendCommand(ADS122C04_RESET_CMD);     }
+void ADC_powerdown(void) { ADS122C04_sendCommand(ADS122C04_POWERDOWN_CMD); }
+
+void ADS122C04_sendCommandWithValue(uint8_t command, uint8_t value) {
+    start_transmission(ADS122C04_ADDR); write_on_bus(command); write_on_bus(value); stop_transmission();
+}
+void ADS122C04_writeReg(uint8_t reg, uint8_t writeValue) {
+    ADS122C04_sendCommandWithValue(ADS122C04_WRITE_CMD(reg), writeValue);
+}
+
+bool ADS122C04_readReg(uint8_t reg, uint8_t *readValue) {
+    uint8_t command = ADS122C04_READ_CMD(reg);
+    start_transmission(ADS122C04_ADDR); write_on_bus(command); stop_transmission();
+    if (I2C_RawStart(ADS122C04_ADDR, I2C_READ)) { I2C_RawStop(); }
+    if (I2C_RawRead(1)) { I2C_RawStop(); return(false); }
+    else { *readValue = memdata; I2C_RawStop(); return(true); }
+}
+
+bool ADS122C04_getConversionData(uint32_t *conversionData) {
+    uint8_t RXByte[3] = {0};
+    start_transmission(ADS122C04_ADDR); write_on_bus(ADS122C04_RDATA_CMD); stop_transmission();
+    if (I2C_RawStart(ADS122C04_ADDR, I2C_READ)) { I2C_RawStop(); }
+    if (I2C_RawRead(1)) { I2C_RawStop(); } RXByte[0] = memdata;
+    if (I2C_RawRead(1)) { I2C_RawStop(); } RXByte[1] = memdata;
+    if (I2C_RawRead(1)) { I2C_RawStop(); } RXByte[2] = memdata;
+    *conversionData = ((uint32_t)RXByte[2]) | ((uint32_t)RXByte[1]<<8) | ((uint32_t)RXByte[0]<<16);
+    return(true);
+}
+uint32_t readADC(void) { uint32_t r; ADS122C04_getConversionData(&r); return r; }
+
+bool checkDataReady(void) {
+    ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+    return(ADS122C04_Reg.reg2.bit.DRDY > 0);
+}
+
+void setInputMultiplexer(uint8_t m)     { ADS122C04_Reg.reg0.bit.MUX       = m; ADS122C04_writeReg(0, ADS122C04_Reg.reg0.all); }
+void setGain(uint8_t g)                 { ADS122C04_Reg.reg0.bit.GAIN      = g; ADS122C04_writeReg(0, ADS122C04_Reg.reg0.all); }
+void enablePGA(uint8_t e)               { ADS122C04_Reg.reg0.bit.PGA_BYPASS= e; ADS122C04_writeReg(0, ADS122C04_Reg.reg0.all); }
+void setDataRate(uint8_t r)             { ADS122C04_Reg.reg1.bit.DR        = r; ADS122C04_writeReg(1, ADS122C04_Reg.reg1.all); }
+void setOperatingMode(uint8_t m)        { ADS122C04_Reg.reg1.bit.MODE      = m; ADS122C04_writeReg(1, ADS122C04_Reg.reg1.all); }
+void setConversionMode(uint8_t m)       { ADS122C04_Reg.reg1.bit.CMBIT     = m; ADS122C04_writeReg(1, ADS122C04_Reg.reg1.all); }
+void setVoltageReference(uint8_t r)     { ADS122C04_Reg.reg1.bit.VVREF     = r; ADS122C04_writeReg(1, ADS122C04_Reg.reg1.all); }
+void enableInternalTempSensor(uint8_t e){ ADS122C04_Reg.reg1.bit.TS        = e; ADS122C04_writeReg(1, ADS122C04_Reg.reg1.all); }
+void setDataCounter(uint8_t e)          { ADS122C04_Reg.reg2.bit.DCNT      = e; ADS122C04_writeReg(2, ADS122C04_Reg.reg2.all); }
+void setDataIntegrityCheck(uint8_t s)   { ADS122C04_Reg.reg2.bit.CRCbits   = s; ADS122C04_writeReg(2, ADS122C04_Reg.reg2.all); }
+void setBurnOutCurrent(uint8_t e)       { ADS122C04_Reg.reg2.bit.BCS       = e; ADS122C04_writeReg(2, ADS122C04_Reg.reg2.all); }
+void setIDACcurrent(uint8_t c)          { ADS122C04_Reg.reg2.bit.IDAC      = c; ADS122C04_writeReg(2, ADS122C04_Reg.reg2.all); }
+void setIDAC1mux(uint8_t s)             { ADS122C04_Reg.reg3.bit.I1MUX     = s; ADS122C04_writeReg(3, ADS122C04_Reg.reg3.all); }
+void setIDAC2mux(uint8_t s)             { ADS122C04_Reg.reg3.bit.I2MUX     = s; ADS122C04_writeReg(3, ADS122C04_Reg.reg3.all); }
+
+/* ================================================================== */
+/*  TIMER / MILLIS                                                     */
+/* ================================================================== */
+void timer_init(void) {
+    TCA0.SINGLE.CTRLA   = TCA_SINGLE_CLKSEL_DIV64_gc;
+    TCA0.SINGLE.PER     = 52;
+    TCA0.SINGLE.INTCTRL = TCA_SINGLE_OVF_bm;
+    TCA0.SINGLE.CTRLA  |= TCA_SINGLE_ENABLE_bm;
+}
+ISR(TCA0_OVF_vect) { millis_count++; TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm; }
+
+/* ================================================================== */
+/*  EEPROM HELPERS -- original (limit / offset / reference)           */
+/* ================================================================== */
+void mem_write(unsigned int addr, long int val) {
+    unsigned int r = val/10000, s = val%10000;
+    eeprom_write_byte((uint8_t*)(1*addr), r);            while(!eeprom_is_ready());
+    addr++; eeprom_write_byte((uint8_t*)(1*addr), s/256); while(!eeprom_is_ready());
+    addr++; eeprom_write_byte((uint8_t*)(1*addr), s%256); while(!eeprom_is_ready());
+}
+long int mem_read(uint8_t addr) {
+    long int l = eeprom_read_byte((uint8_t*)(1*addr)); asm("nop"); addr++;
+    unsigned int m = eeprom_read_byte((uint8_t*)(1*addr)); asm("nop"); addr++;
+    unsigned int n = eeprom_read_byte((uint8_t*)(1*addr));
+    _delay_ms(30);
+    return (l*10000 + m*256 + n);
+}
+
+/* ================================================================== */
+/*  UART                                                               */
+/* ================================================================== */
+void USART1_sendChar(char c) { while (!(USART1.STATUS & USART_DREIF_bm)) {} USART1.TXDATAL = c; }
+void USART1_sendStr(const char *s) { while (*s) USART1_sendChar(*s++); }
+void tx_newline(void) { USART1_sendChar(0x0D); USART1_sendChar(0x0A); }
+
+void USART1_sendUInt(uint32_t v) {
+    char buf[11]; uint8_t i = 0;
+    if (v == 0) { USART1_sendChar('0'); return; }
+    while (v > 0) { buf[i++] = '0' + (v % 10); v /= 10; }
+    while (i--) USART1_sendChar(buf[i]);
+}
+
+void USART1_sendLong(long v) {
+    if (v < 0) { USART1_sendChar('-'); v = -v; }
+    USART1_sendUInt((uint32_t)v);
+}
+
+void USART1_sendFloat(float v, uint8_t decimals) {
+    if (v < 0.0f) { USART1_sendChar('-'); v = -v; }
+    float mult = 1.0f;
+    for (uint8_t i = 0; i < decimals; i++) mult *= 10.0f;
+    long full  = (long)(v * mult + 0.5f);
+    long iv    = full / (long)mult;
+    long frac  = full % (long)mult;
+    USART1_sendUInt((uint32_t)iv);
+    USART1_sendChar('.');
+    long fmult = (long)mult / 10;
+    while (fmult > 1 && frac < fmult) { USART1_sendChar('0'); fmult /= 10; }
+    if (frac > 0) USART1_sendUInt((uint32_t)frac);
+    else USART1_sendChar('0');
+}
+
+static void tx_raw_emf(long long int raw_milli_mv) {
+    if (raw_milli_mv < 0) raw_milli_mv = 0;
+    long long v = raw_milli_mv;
+    USART1_sendChar((v/1000000)%10 + '0');
+    USART1_sendChar((v/100000)%10  + '0');
+    USART1_sendChar((v/10000)%10   + '0');
+    USART1_sendChar((v/1000)%10    + '0');
+    USART1_sendChar('.');
+    USART1_sendChar((v/100)%10     + '0');
+    USART1_sendChar((v/10)%10      + '0');
+    USART1_sendChar((v/1)%10       + '0');
+}
+
+static void tx_ref_delta(long long int delta_milli_mv) {
+    long long v = delta_milli_mv;
+    if (v >= 0) USART1_sendChar('+');
+    else        { USART1_sendChar('-'); v = -v; }
+    USART1_sendChar((v/1000000)%10 + '0');
+    USART1_sendChar((v/100000)%10  + '0');
+    USART1_sendChar((v/10000)%10   + '0');
+    USART1_sendChar((v/1000)%10    + '0');
+    USART1_sendChar('.');
+    USART1_sendChar((v/100)%10     + '0');
+    USART1_sendChar((v/10)%10      + '0');
+    USART1_sendChar((v/1)%10       + '0');
+}
+
+static const char* flag_str(FlagState f) {
+    switch (f) {
+        case FLAG_AIR:       return "AIR";
+        case FLAG_UP:        return "UP";
+        case FLAG_DOWN:      return "DOWN";
+        case FLAG_REC:       return "REC";
+        case FLAG_OVERRANGE: return "OVERRANGE";
+        case FLAG_WAIT:      return "WAIT";
+        case FLAG_STABLE:    return "STABLE";
+    }
+    return "AIR";
+}
+
+/* ================================================================== */
+/*  SENSOR READ                                                        */
+/* ================================================================== */
+void set_sample_timing(uint8_t dr) {
+    switch(dr) {
+        case ADS122C04_DATA_RATE_20SPS:   inter_sample_ms=50;  drdy_timeout_ms=75;  break;
+        case ADS122C04_DATA_RATE_45SPS:   inter_sample_ms=22;  drdy_timeout_ms=75;  break;
+        case ADS122C04_DATA_RATE_90SPS:   inter_sample_ms=44;  drdy_timeout_ms=44;  break;
+        case ADS122C04_DATA_RATE_175SPS:  inter_sample_ms=30;  drdy_timeout_ms=36;  break;
+        case ADS122C04_DATA_RATE_330SPS:  inter_sample_ms=12;  drdy_timeout_ms=18;  break;
+        case ADS122C04_DATA_RATE_600SPS:  inter_sample_ms=8;   drdy_timeout_ms=12;  break;
+        case ADS122C04_DATA_RATE_1000SPS: inter_sample_ms=4;   drdy_timeout_ms=8;   break;
+        default:                          inter_sample_ms=50;  drdy_timeout_ms=75;  break;
+    }
+}
+
+void filter_raw_sensor(void) {
+    if (sensor_final_output >= pub_adc_value) {
+        diff_adc_value = sensor_final_output - pub_adc_value;
+        if (diff_adc_value > (float)limit) pub_adc_value = sensor_final_output;
+        else                               sensor_final_output = pub_adc_value;
+    } else {
+        diff_adc_value = pub_adc_value - sensor_final_output;
+        if (diff_adc_value > (float)limit) pub_adc_value = sensor_final_output;
+        else                               sensor_final_output = pub_adc_value;
+    }
+}
+
+static void read_sensor_slow(void) {
+    float adc_avg = 0.0f;
+    for (unsigned int i = 0; i < 4; i++) {
+        bool drdy = 0; uint16_t mc = 0; start();
+        do { mc++; _delay_ms(1); drdy = checkDataReady(); } while (!drdy && mc < drdy_timeout_ms);
+        uint32_t raw = readADC(); if (raw >= 0x800000) raw = 0;
+        adc_avg += ((float)raw) / 4096.0f * 1000.0f;
+        for (uint16_t d = 0; d < inter_sample_ms; d++) _delay_ms(1);
+    }
+    sensor_final_output = adc_avg / 4.0f;
+    if (sensor_final_output > 2047999.0f) sensor_final_output = 2047999.0f;
+    filter_raw_sensor();
+}
+
+static void read_sensor_single(void) {
+    bool drdy = 0; uint32_t t = millis_count; start();
+    do { drdy = checkDataReady(); } while (!drdy && (millis_count - t) < drdy_timeout_ms);
+    uint32_t raw = readADC(); if (raw >= 0x800000) raw = 0;
+    sensor_final_output = ((float)raw) / 4096.0f * 1000.0f;
+    if (sensor_final_output > 2047999.0f) sensor_final_output = 2047999.0f;
+    t = millis_count; while ((millis_count - t) < inter_sample_ms) {}
+    filter_raw_sensor();
+}
+
+void read_sensor(void) {
+    switch (diag_dr) {
+        case ADS122C04_DATA_RATE_20SPS:
+        case ADS122C04_DATA_RATE_45SPS: read_sensor_slow();   break;
+        default:                        read_sensor_single(); break;
+    }
+}
+
+/* ================================================================== */
+/*  COMMAND PARSER                                                     */
+/* ================================================================== */
+
+/* tx_flush: wait until the shift register has fully clocked out the
+   last byte before sending more. Prevents burst corruption on long
+   outputs like send_params(). */
+static void tx_flush(void) {
+    while (!(USART1.STATUS & USART_TXCIF_bm)) {}
+    USART1.STATUS = USART_TXCIF_bm;
+}
+
+static void send_params(void) {
+    USART1_sendStr("PARAMS:\r\n");           tx_flush();
+    USART1_sendStr(" JMP="); USART1_sendFloat(P.jmp,          5); tx_newline(); tx_flush();
+    USART1_sendStr(" ALP="); USART1_sendFloat(P.alp,          5); tx_newline(); tx_flush();
+    USART1_sendStr(" UPG="); USART1_sendFloat(P.upG,          2); tx_newline(); tx_flush();
+    USART1_sendStr(" ING="); USART1_sendFloat(P.inG,          4); tx_newline(); tx_flush();
+    USART1_sendStr(" DNG="); USART1_sendFloat(P.dnG,          2); tx_newline(); tx_flush();
+    USART1_sendStr(" DNI="); USART1_sendFloat(P.dnI,          4); tx_newline(); tx_flush();
+    USART1_sendStr(" REC="); USART1_sendFloat(P.rec,          4); tx_newline(); tx_flush();
+    USART1_sendStr(" DRF="); USART1_sendFloat(P.drf,          2); tx_newline(); tx_flush();
+    USART1_sendStr(" NTH="); USART1_sendFloat(P.n_thresh,     6); tx_newline(); tx_flush();
+    USART1_sendStr(" OCP="); USART1_sendUInt(P.o_cap);             tx_newline(); tx_flush();
+    USART1_sendStr(" RZP="); USART1_sendFloat(P.rec_zero_pct, 4); tx_newline(); tx_flush();
+    USART1_sendStr(" WRM="); USART1_sendUInt(P.warmup);            tx_newline(); tx_flush();
+    USART1_sendStr(" ORT="); USART1_sendFloat(P.or_thresh,    2); tx_newline(); tx_flush();
+    USART1_sendStr(" ORX="); USART1_sendFloat(P.or_exit_mv,   2); tx_newline(); tx_flush();
+    USART1_sendStr(" ORS="); USART1_sendFloat(P.or_sd_stable, 8); tx_newline(); tx_flush();
+    USART1_sendStr("CALIB:\r\n");            tx_flush();
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        USART1_sendStr(" ["); USART1_sendUInt(i); USART1_sendStr("] ");
+        USART1_sendFloat(CALIB[i].p_mv, 4);
+        USART1_sendStr("mV -> ");
+        USART1_sendLong(CALIB[i].ppm);
+        USART1_sendStr("ppm\r\n"); tx_flush();
+    }
+    USART1_sendStr("END\r\n"); tx_flush();
+}
+
+/* Robust float/long parsers (avoids atof()/atol() precision issues on AVR) */
+static long parse_long(char **str) {
+    char *p = *str;
+    while (*p == ' ' || *p == '\t') p++;
+    long sign = 1;
+    if      (*p == '-') { sign = -1; p++; }
+    else if (*p == '+') {            p++; }
+    long val = 0;
+    while (*p >= '0' && *p <= '9') { val = val * 10 + (*p++ - '0'); }
+    *str = p;
+    return sign * val;
+}
+
+static float parse_float(char **str) {
+    char *p = *str;
+    while (*p == ' ' || *p == '\t') p++;
+    float sign = 1.0f;
+    if      (*p == '-') { sign = -1.0f; p++; }
+    else if (*p == '+') {               p++; }
+    long int_part = 0;
+    while (*p >= '0' && *p <= '9') { int_part = int_part * 10 + (*p++ - '0'); }
+    float val = (float)int_part;
+    if (*p == '.') {
+        p++;
+        float frac = 0.0f, scale = 0.1f;
+        while (*p >= '0' && *p <= '9') { frac += (*p++ - '0') * scale; scale *= 0.1f; }
+        val += frac;
+    }
+    *str = p;
+    return sign * val;
+}
+
+static void process_cmd(void) {
+    const char *s = (const char*)&company[1];
+
+    /* *start# */
+    if (s[0]=='s' && s[1]=='t' && s[2]=='a' && s[3]=='r' && s[4]=='t' && s[5]=='#') {
+        is_running = true;
+        USART1_sendStr("OK_START\r\n");
+        USART1_sendStr("COLS: raw_mV  ref_delta  ppm  flag  rec%  baseline_mV\r\n");
+        return;
+    }
+
+    /* *TEAR# */
+    if (s[0]=='T' && s[1]=='E' && s[2]=='A' && s[3]=='R' && s[4]=='#') {
+        do_tear(); return;
+    }
+
+    /* *RF<7-digit># */
+    if (s[0]=='R' && s[1]=='F' && rxcntr==12) {
+        long long a = ((s[2]-'0')*1000000LL) + ((s[3]-'0')*100000LL)
+                    + ((s[4]-'0')*10000LL)   + ((s[5]-'0')*1000LL)
+                    + ((s[6]-'0')*100LL)     + ((s[7]-'0')*10LL)
+                    + ((s[8]-'0')*1LL);
+        Reference_Set_Value = a;
+        mem_write(220, (long)Reference_Set_Value);
+        USART1_sendStr("OK\r\n"); return;
+    }
+
+    /* *T<4-digit><2-digit># */
+    if (s[0]=='T' && rxcntr==10) {
+        long a = (s[1]-'0')*1000L + (s[2]-'0')*100L + (s[3]-'0')*10L + (s[4]-'0');
+        long b = (s[6]-'0')*10L   + (s[7]-'0');
+        limit        = (unsigned int)a;
+        offset_value = (unsigned char)b;
+        mem_write(6,   (long)limit);
+        mem_write(150, (long)offset_value);
+        USART1_sendStr("OK\r\n"); return;
+    }
+
+    /* *CAL# */
+    if (s[0]=='C' && s[1]=='A' && s[2]=='L' && s[3]=='#') {
+        do_calibrate(); return;
+    }
+
+    /* *GET PARAMS# */
+    if (strncmp(s, "GET PARAMS", 10) == 0) {
+        send_params(); return;
+    }
+
+    /* *SET CAL <idx> <mV> <ppm># */
+    if (s[0]=='S' && s[1]=='E' && s[2]=='T' && s[3]==' ' &&
+        s[4]=='C' && s[5]=='A' && s[6]=='L' && s[7]==' ') {
+
+        char *ptr = (char*)&s[8];
+        int   idx = (int)parse_long(&ptr);
+        float mv  = parse_float(&ptr);
+        long  ppm = parse_long(&ptr);
+
+        if (idx >= 0 && idx < CALIB_N) {
+            CALIB[idx].p_mv = mv;
+            CALIB[idx].ppm  = ppm;
+            calib_ee_save_entry((uint8_t)idx);
+            USART1_sendStr("OK SET CAL\r\n");
+        } else {
+            USART1_sendStr("ERR_IDX\r\n");
+        }
+        return;
+    }
+
+    /* *SET <KEY> <value># */
+    if (s[0]=='S' && s[1]=='E' && s[2]=='T' && s[3]==' ') {
+        char key[4] = {s[4], s[5], s[6], 0};
+        char *ptr   = (char*)&s[8];
+        float fval  = parse_float(&ptr);
+        bool  ok    = true;
+
+        if      (strcmp(key,"JMP")==0) P.jmp          = fval;
+        else if (strcmp(key,"ALP")==0) P.alp          = fval;
+        else if (strcmp(key,"UPG")==0) P.upG          = fval;
+        else if (strcmp(key,"ING")==0) P.inG          = fval;
+        else if (strcmp(key,"DNG")==0) P.dnG          = fval;
+        else if (strcmp(key,"DNI")==0) P.dnI          = fval;
+        else if (strcmp(key,"REC")==0) P.rec          = fval;
+        else if (strcmp(key,"DRF")==0) P.drf          = fval;
+        else if (strcmp(key,"NTH")==0) P.n_thresh     = fval;
+        else if (strcmp(key,"OCP")==0) P.o_cap        = (uint16_t)fval;
+        else if (strcmp(key,"RZP")==0) P.rec_zero_pct = fval;
+        else if (strcmp(key,"WRM")==0) P.warmup       = (uint16_t)fval;
+        else if (strcmp(key,"ORT")==0) P.or_thresh    = fval;
+        else if (strcmp(key,"ORX")==0) P.or_exit_mv   = fval;
+        else if (strcmp(key,"ORS")==0) P.or_sd_stable = fval;
+        else ok = false;
+
+        if (ok) {
+            USART1_sendStr("OK SET "); USART1_sendStr(key);
+            USART1_sendChar('='); USART1_sendFloat(fval, 6);
+            tx_newline();
+        } else {
+            USART1_sendStr("ERR_UNKNOWN_KEY\r\n");
+        }
+        return;
+    }
+
+    USART1_sendStr("ERR_CMD\r\n");
+}
+
+ISR(USART1_RXC_vect) {
+    unsigned char c = USART1.RXDATAL;
+    if (c == '*') { strt = 1; rxcntr = 0; }
+    if (strt == 1) {
+        if (rxcntr < CMD_BUF_LEN - 1) company[rxcntr++] = c;
+        if (c == '#') {
+            company[rxcntr] = '\0';
+            cmd_ready = true; strt = 0;
+        }
+    }
+}
+
+void USART1_init(void) {
+    PORTA.DIR &= ~PIN2_bm;
+    PORTA.DIR |=  PIN1_bm;
+    USART1.BAUD  = (uint16_t)USART1_BAUD_RATE(9600);
+    USART1.CTRLA = 0 << USART_ABEIE_bp | 0 << USART_DREIE_bp | 0 << USART_LBME_bp
+                 | 1 << USART_RS485_bp  | 1 << USART_RXCIE_bp | 0 << USART_RXSIE_bp
+                 | 0 << USART_TXCIE_bp;
+    USART1.CTRLB |= USART_RXEN_bm | USART_TXEN_bm;
+}
+
+/* ================================================================== */
+/*  OUTPUT LINE  (Addition C: 6th column = baseline_mV)               */
+/* ================================================================== */
+static void tx_output_line(long long int raw_milli_mv, long long int ref_delta_mv) {
+    tx_raw_emf(raw_milli_mv);
+    USART1_sendStr("  ");
+
+    tx_ref_delta(ref_delta_mv);
+    USART1_sendStr("  ");
+
+    USART1_sendLong(Q_ppm);
+    USART1_sendStr("  ");
+
+    USART1_sendStr(flag_str(disp_flag));
+    USART1_sendStr("  ");
+
+    USART1_sendUInt((uint32_t)(rec_pct + 0.5f));
+    USART1_sendChar('%');
+    USART1_sendStr("  ");
+
+    /* Column 6: print "WARMDONE" on the one sample warmup finishes,
+       then live baseline_L (in mV) every sample after that. */
+    if (warmup_just_done) {
+        USART1_sendStr("WARMDONE");
+        warmup_just_done = false;
+    } else {
+        USART1_sendFloat(baseline_L, 3);
+    }
+
+    USART1_sendChar(0x0D); USART1_sendChar(0x0A);
+}
+
+/* ================================================================== */
+/*  RUN MODE                                                           */
+/* ================================================================== */
+void run_mode(void) {
+    while (1) {
+        /* Command polling -- always active regardless of is_running */
+        if (cmd_ready) {
+            cmd_ready = false;
+            process_cmd();
+        }
+
+        /* Gate: hold here until *start# is received */
+        if (!is_running) continue;
+
+        /* One ADC read = one engine step = one output line */
+        read_sensor();
+
+        float raw_mv_milli_f   = sensor_final_output;
+        float delta_mv_milli_f = raw_mv_milli_f - (float)Reference_Set_Value;
+        float emf_mv           = delta_mv_milli_f / 1000.0f;
+
+        engine_step(emf_mv);
+
+        long long int raw_milli_mv   = (long long int)raw_mv_milli_f;
+        long long int delta_mv_milli = (long long int)delta_mv_milli_f;
+
+        USART1_sendChar(0x0A);
+        tx_output_line(raw_milli_mv, delta_mv_milli);
+    }
+}
+
+/* ================================================================== */
+/*  MAIN                                                               */
+/* ================================================================== */
+int main(void) {
+    PORTA_DIR    = 0xFF;
+    PORTA_OUTSET = ADC_RESET;
+    PORTB_DIR    = 0xFF;
+    _delay_ms(500);
+
+    InitI2C();
+    USART1_init();
+    _delay_ms(100);
+
+    timer_init();
+    sei();
+
+    limit = (unsigned int)mem_read(6);
+    _delay_ms(20);
+
+    Reference_Set_Value = mem_read(220);
+    if (Reference_Set_Value > 2000000) Reference_Set_Value = 0;
+
+    offset_value = mem_read(150);
+    if (offset_value > 100) offset_value = 30;
+
+    calib_ee_load();   /* load calibration table from EEPROM (or write defaults) */
+
+    USART1_sendStr("MNST\r\n");
+    USART1_sendStr("T5-H2-V2 READY\r\n");
+    USART1_sendStr("Send *start# to begin. Active cmds: *SET *CAL *TEAR *GET PARAMS *RF *T\r\n");
+
+    setInputMultiplexer(ADS122C04_MUX_AIN1_AIN0);
+    setGain(ADS122C04_GAIN_1);
+    enablePGA(ADS122C04_PGA_DISABLED);
+    setDataRate(ADS122C04_DATA_RATE_175SPS);
+    setOperatingMode(ADS122C04_OP_MODE_NORMAL);
+    setConversionMode(ADS122C04_CONVERSION_MODE_SINGLE_SHOT);
+    setVoltageReference(ADS122C04_VREF_INTERNAL);
+    enableInternalTempSensor(ADS122C04_TEMP_SENSOR_OFF);
+    setDataCounter(ADS122C04_DCNT_DISABLE);
+    setDataIntegrityCheck(ADS122C04_CRC_DISABLED);
+    setBurnOutCurrent(ADS122C04_BURN_OUT_CURRENT_OFF);
+    setIDACcurrent(ADS122C04_IDAC_CURRENT_OFF);
+    setIDAC1mux(ADS122C04_IDAC1_DISABLED);
+    setIDAC2mux(ADS122C04_IDAC2_DISABLED);
+    _delay_ms(5);
+
+    uint8_t rb0 = 0, rb1 = 0;
+    ADS122C04_readReg(ADS122C04_CONFIG_0_REG, &rb0);
+    ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &rb1);
+    diag_dr   = (rb1 >> 5) & 0x07;
+    diag_pga  = rb0 & 0x01;
+    diag_gain = (rb0 >> 1) & 0x07;
+    set_sample_timing(diag_dr);
+
+    reset();
+    _delay_ms(2);
+    setDataRate(ADS122C04_Reg.reg1.bit.DR);
+
+    run_mode();
+}
