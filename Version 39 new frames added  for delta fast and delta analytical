@@ -1,0 +1,3526 @@
+/*
+ * Smart_Probe_H2_v5_band.c
+ * ============================================================
+ * All changes from v5_band(CHANGE 14) retained. New change in this revision:
+ *
+ *  CHANGE 15 ? DELTA-EMF (fast + analytical) added to the diagnostic
+ *  frame and to continuous output:
+ *    These are the EXACT two values *1CAL / *10CAL calibrate from:
+ *        DeltaF = P_clip   (fast path, clipped accumulator)
+ *        DeltaA = N_accum  (analytical path, bulk accumulator)
+ *    so the host can watch them live and fire the one-shot calibration
+ *    at the right moment instead of guessing.
+ *
+ *    DIAGNOSTIC FRAME: 24 bytes -> 28 bytes. The 4 new bytes are
+ *    APPENDED at the end of the payload, immediately before the CRC, so
+ *    every existing field keeps its current offset (B01..B21 unchanged):
+ *        B22-B23  DF  DeltaF mV x10, big-endian int16
+ *        B24-B25  DA  DeltaA mV x10, big-endian int16
+ *        B26      CRC-lo   (CRC-16/IBM now over B02..B25)
+ *        B27      CRC-hi
+ *        B28      0x0D end byte
+ *    Host decode: value_mV = (int16 big-endian) / 10.0
+ *    x10 int16 gives 1 decimal place over +-3276.7 mV, far beyond the
+ *    ~820 mV these signals can reach; the value is CLAMPED to the int16
+ *    range so it can never wrap.
+ *
+ *    TRUNCATED, NOT ROUNDED: the 1 decimal place is CLIPPED
+ *    (309.699 -> 309.6, never 309.7), in the frame and on screen alike.
+ *    USART1_sendFloat() rounds (it adds 0.5), so it is NOT used for these
+ *    two fields ? new helper tx_1dp_trunc() prints the clipped form and
+ *    emf_x10_clip() produces the clipped int16 for the frame.
+ *
+ *    DATA FRAME (12 bytes) is UNCHANGED ? it stays the lean frame.
+ *    tx_stopped_frame() diag branch is kept in sync (28 bytes, the two
+ *    new fields sent as 0), as are the continuous stopped columns.
+ *
+ *    CONTINUOUS MODE: two new columns appended after NthMode ?
+ *        Col 12 DeltaF_mV   Col 13 DeltaA_mV   (both 1 dp, truncated)
+ *    The *START# COLS header line lists them, so existing column parsing
+ *    by index is unaffected (nothing was inserted or reordered).
+ *
+ *    Nothing else changes: no detection-engine math, no calibration
+ *    behaviour, no command behaviour ? these are pure read-outs of state
+ *    the engine already maintains.
+ *
+ * ============================================================
+ * All changes from v5_band(CHANGE 13) retained. New change in previous revision:
+ *
+ *  CHANGE 14 ? reject non-numeric command arguments (ERR instead of
+ *  silently writing 0):
+ *    parse_float()/parse_long() return 0 for junk such as "BIHAR" and
+ *    report no error. So *SET UPG BIHAR# matched the UPG key, wrote
+ *    P.upG = 0.0, saved it to EEPROM and answered OK ? silently
+ *    destroying a detection parameter. (An unknown KEY such as
+ *    *SET UP BIHAR# already answered ERR_UNKNOWN_KEY; it was a valid key
+ *    with a junk VALUE that slipped through.)
+ *    New helper is_num() validates that an argument is a complete number
+ *    ([+|-] digits [. digits] terminated by space/# /NUL). Applied to:
+ *      - the early *SET UPG# / *SET ING# handler -> ERR_VALUE
+ *      - the generic *SET <KEY> <value>#         -> ERR_VALUE
+ *      - *SETCONC <idx> <new_ppm>#  (both args)  -> ERR_VALUE
+ *    Nothing is written when the value is rejected, and the frame-mode
+ *    ack becomes ERR via the existing CHANGE 11 tx_ack("ERR...") path.
+ *    *SET SFSTEP# and *1CAL# were already safe (junk -> 0 -> fails their
+ *    existing range/tier check -> ERR). *SET CAL# / *SET ANCAL# are still
+ *    unvalidated ? see notes.
+ *
+ * ============================================================
+ * All changes from v5_band(CHANGE 12) retained. New change in previous revision:
+ *
+ *  CHANGE 13 ? *SETCONC now addressed BY ROW INDEX, with per-index bands:
+ *
+ *    NEW FORMAT:  *SETCONC <idx> <new_ppm>#     (was <old_ppm> <new_ppm>)
+ *    The caller no longer needs to know the row's PRESENT concentration,
+ *    so no *GET PARAMS# round-trip is needed before re-labelling a row
+ *    that was already changed once. Fixed row indices:
+ *        idx 0 = 0        idx 3 = 100      idx 6 = 10000
+ *        idx 1 = 5        idx 4 = 1000     idx 7 = 20000
+ *        idx 2 = 10       idx 5 = 5000     idx 8 = 100000
+ *    Behaviour is otherwise IDENTICAL to CHANGE 12: only the ppm column
+ *    of that row changes; p_mv, band_mv and sf are untouched; the row is
+ *    updated in BOTH the FAST and AN tables and only that row is written
+ *    to EEPROM (calib_save_entry).
+ *
+ *    ALLOWED BANDS ? new_ppm must lie within the band of that index:
+ *        idx 2 (10 ppm)     +/-4     ->      6 ..     14
+ *        idx 5 (5000 ppm)   +/-500   ->   4500 ..   5500
+ *        idx 6 (10000 ppm)  +/-1000  ->   9000 ..  11000
+ *        idx 7 (20000 ppm)  +/-1000  ->  19000 ..  21000
+ *        idx 8 (100000 ppm) +/-1000  ->  99000 .. 101000
+ *        idx 0,1,3,4        unrestricted (re-label freely)
+ *    Each band is centred on that index's FACTORY nominal ppm, NOT on the
+ *    row's current value, so the window never drifts: idx 5 always accepts
+ *    4500..5500 however many times it has been re-labelled. Out of band =>
+ *    ERR_BAND and NOTHING is written. Bad index => ERR_IDX.
+ *
+ *    CONSEQUENTIAL FIX (required, else *1CAL / *10CAL break after re-label):
+ *    tier_idx() and the *10CAL row lookup matched concentrations EXACTLY,
+ *    so after e.g. *SETCONC 5 5200# neither *1CAL 5200# nor *1CAL 5000#
+ *    could find the row. Both now match by the SAME bands as above:
+ *      - tier_idx(ppm) returns a tier slot if ppm is inside that slot's
+ *        band. The slot INDEX is unchanged, so the cross-concentration
+ *        SF-step math in do_oneshot_calib is byte-identical ? only which
+ *        ppm labels map to a slot widened from a point to a band.
+ *      - the scaling loop's high-row test became
+ *        (ppm >= CALIB_HIGH_PPM || tier_idx(ppm) >= 0) so a tier
+ *        re-labelled below 5000 (e.g. 4500) is still scaled.
+ *      - *10CAL picks the row NEAREST nominal 10 within 6..14. The 5 ppm
+ *        row is outside that band, so there is no 5-vs-10 ambiguity and
+ *        the default table behaves exactly as the old ==10 match did.
+ *    Persistence is automatic: the re-labelled row is saved to EEPROM and
+ *    reloaded at boot, and the bands are fixed compile-time constants, so
+ *    there is nothing to rebuild and no new EEPROM bytes are used.
+ *
+ *    Nothing else changes: not p_mv/band/sf, not the detection engine, not
+ *    any other command. Frame mode uses the standard OK/ERR ack.
+ *
+ * ============================================================
+ * All changes from v5_band(CHANGE 11) retained. New change in previous revision:
+ *
+ *  CHANGE 12 ? *SETCONC <old_ppm> <new_ppm># : re-label a calibration
+ *  concentration in place. Works in BOTH continuous and frame mode.
+ *    - Finds the row whose ppm == <old_ppm> and changes ONLY its ppm
+ *      field to <new_ppm>. p_mv, band_mv and sf are left exactly as they
+ *      were ? identical to hand-editing the ppm column of that row. The
+ *      next calib_interp() then interpolates against the new ppm.
+ *    - Applied to BOTH the FAST and AN tables (the ppm/concentration
+ *      column is shared between them), so they stay consistent. A row is
+ *      matched independently in each table; if <old_ppm> exists in one
+ *      table but not the other, only the table(s) that have it are
+ *      updated. At least one match in either table => success + EEPROM
+ *      save of exactly the changed row(s) (calib_save_entry, same as
+ *      *SET CAL/ANCAL). No match in either table => ERR_NOCONC, nothing
+ *      written.
+ *    - Nothing else changes: not p_mv/band/sf, not the detection engine,
+ *      not other rows, not any other command. In frame mode it uses the
+ *      standard OK/ERR ack via the CHANGE 11 path (tx_ack ERR sets
+ *      cmd_failed); in continuous mode it prints a short ASCII report.
+ *
+ *  CHANGE 11 ? Frame-mode ERR ack for rejected commands:
+ *    - Previously EVERY command in frame mode got the 0x0A "OK" 0x0D
+ *      ack, even invalid ones (bad key, bad index, unknown command,
+ *      failed calibration), so the host could not tell success from
+ *      failure. Now a rejected command replies with 0x0A "ERR" 0x0D
+ *      instead.
+ *    - Mechanism: every failure path in the dispatcher already calls
+ *      tx_ack("ERR_...") (its ASCII text is suppressed in frame mode).
+ *      tx_ack() now inspects the string: if it begins with "ERR", it
+ *      sets the cmd_failed flag. The process_cmd() wrapper then sends
+ *      "ERR" instead of "OK". One hook, all ~15 existing error sites
+ *      covered ? no per-site edits, no risk of missing one.
+ *    - cmd_failed is reset at the START of every command, so the verdict
+ *      always reflects only the command just processed.
+ *    - Success/verbose ASCII acks in continuous mode are unchanged. The
+ *      ack payload in frame mode is now exactly "OK" (accepted) or
+ *      "ERR" (rejected) ? both in the same 0x0A...0x0D envelope, so the
+ *      host classifies by the 2nd/3rd byte.
+ *    - *GET PARAMS# is unaffected: it still sends its 0x23...0x0D blob
+ *      and suppresses the trailing ack entirely (suppress_frame_ok).
+ *      If GET PARAMS itself somehow failed it would fall through to an
+ *      ERR like any other command.
+ *
+ *  CHANGE 9 ? *GET PARAMS# full dump now available in frame mode too
+ *  (supersedes the CHANGE 8 note that kept it suppressed):
+ *    - send_params() no longer early-returns in frame mode. Instead each
+ *      output line is wrapped in the MNST-style envelope
+ *          0x0A <ASCII line> 0x0D          (no trailing "\r\n")
+ *      via the new sp_bol()/sp_eol() helpers, so the host frame parser
+ *      receives ~40 short delimited ASCII messages -- the exact same
+ *      pattern it already accepts for "MNST" at boot and the CHANGE 8
+ *      "OK" ack. The dump ends with the "END" line, followed by the
+ *      wrapper's uniform OK envelope.
+ *    - In continuous/idle mode the output is byte-for-byte IDENTICAL to
+ *      the previous format (sp_eol() emits "\r\n" there) -- existing
+ *      host-side parsing is untouched.
+ *    - Safety: commands are only serviced between samples, so the dump
+ *      always lands BETWEEN two complete binary frames -- no frame is
+ *      ever split. Frame output simply pauses for the dump duration
+ *      (~0.7 s at 9600 baud) and resumes on the next sample, the same
+ *      stall continuous mode has always had during *GET PARAMS#.
+ *    - The per-line PLE() flush/loopback-drain is kept unchanged, so the
+ *      RS-485 echo of every envelope byte is drained line-by-line.
+ *
+ * ============================================================
+ * All changes from v5_band(CHANGE 7) retained. New change in previous revision:
+ *
+ *  CHANGE 8 ? Full command set + uniform "OK" ack in frame mode:
+ *    - The FRAME MODE GATE inside process_cmd() is removed: EVERY
+ *      command (*IGNORE_PROX#, *RF...#, *T...#, *CAL#, *GET PARAMS#,
+ *      *SET ANCAL/CAL/SFSTEP/<KEY>...) now executes in frame mode too,
+ *      not just the previously whitelisted subset. Their side effects
+ *      (EEPROM saves, state resets, param updates) run exactly as in
+ *      continuous mode; only their verbose ASCII output stays
+ *      suppressed, so the binary stream is never corrupted.
+ *    - New uniform acknowledgement: after every command processed while
+ *      in frame mode, the probe emits exactly ONE 4-byte ack
+ *          0x0A 'O' 'K' 0x0D
+ *      -- the same envelope style as the MNST boot message, so the host
+ *      frame parser can recognise it as a short delimited message. It is
+ *      always sent BETWEEN two complete binary frames (command handling
+ *      only ever happens between samples), never inside one.
+ *      Implemented as a thin process_cmd() wrapper around the original
+ *      dispatcher (now process_cmd_dispatch()), so it fires exactly once
+ *      per command regardless of which internal path handled it.
+ *      A frame-mode *stop# also gets the OK ack (after its stopped
+ *      frame). Continuous-mode ASCII acks (OK_START etc.) unchanged.
+ *    - *SET SFSTEP# success report was previously UNGUARDED raw ASCII;
+ *      it is now wrapped in the standard run_mode_state != MODE_FRAME
+ *      guard (this was harmless before only because the gate blocked
+ *      the command from ever reaching frame mode).
+ *    - Because frame mode now ALWAYS transmits at least the OK ack,
+ *      TXCIF is guaranteed set after every command, so the old
+ *      rx_enable_no_flush() hang-avoidance special case in run_mode()
+ *      is obsolete: both command sites now use the full rx_enable(),
+ *      which also correctly drains the RS-485 loopback of the OK bytes.
+ *    - *GET PARAMS# in frame mode: executes (and acks OK) but its large
+ *      ASCII dump remains suppressed -- it would destroy the binary
+ *      stream. Switch to *START# to read the dump.
+ *
+ * ============================================================
+ * All changes from v5_band(CHANGE 6) retained. New change in previous revision:
+ *
+ *  CHANGE 7 ? Reduced sf EEPROM round-trip rounding error (0.05 -> 0.02 step):
+ *    - calib_ee_write_entry()/calib_ee_read_entry() previously stored sf as
+ *      a SIGNED offset-from-1.00, round((sf-1.0)/0.05), range ~ -5.4..7.35,
+ *      worst-case round-trip error +-0.025. In practice this meant *1CAL
+ *      results like sf=0.93 could come back as 0.95 (or worse) after a
+ *      power cycle, purely from EEPROM quantization -- not a logic bug,
+ *      just a coarse grid.
+ *    - Fixed: sf is now stored DIRECTLY (no "-1.0" offset) as an UNSIGNED
+ *      uint8, round(sf/0.02), range 0.00..5.10, worst-case round-trip
+ *      error +-0.01 -- less than half the old error, using the SAME
+ *      single EEPROM byte (no layout change, CALIB_ENTRY_EE_BYTES stays
+ *      10). Safe because sf only ever comes from *1CAL's divisor math
+ *      (starting at 1.00, repeatedly multiplied/divided by
+ *      1 + steps*P.sf_step), which can never legitimately produce sf <= 0
+ *      -- so no sign bit is needed, freeing up range for finer resolution.
+ *    - CALIB_EE_MAGIC_VAL bumped (0xA9 -> 0xAA) so any EEPROM written by
+ *      older firmware (signed/0.05 encoding) is treated as invalid and
+ *      reloaded from defaults on first boot, rather than being misread
+ *      under the new unsigned/0.02 interpretation.
+ *
+ * ============================================================
+ * All changes from v5_band(dynSF) retained. New change in that revision:
+ *
+ *  CHANGE 6 ? Fixed sf EEPROM encoding losing sub-1.0 scaling factors:
+ *    - calib_ee_write_entry() previously stored sf as round((sf-1.0)/0.05)
+ *      in an UNSIGNED byte and clamped negative results to 0. Any *1CAL
+ *      result with sf < 1.0 (routine, since cross-concentration division
+ *      can easily push sf under 1.0) therefore got silently rewritten as
+ *      sf = 1.00 the moment it hit EEPROM -- it read back correctly from
+ *      RAM immediately after calibration, but reverted to 1.00 on the
+ *      very next power cycle.
+ *    - Fixed: the byte is now interpreted as a SIGNED int8 (-128..127),
+ *      so sf can legitimately be stored and reloaded anywhere from about
+ *      -5.4 to 7.35 in the same 0.05 steps as before. No layout/size
+ *      change (still 1 byte per row) -- just correct rounding + no more
+ *      negative clamp.
+ *    - CALIB_EE_MAGIC_VAL bumped (0xA8 -> 0xA9) so any EEPROM written by
+ *      older firmware is treated as invalid and reloaded from defaults
+ *      on first boot, rather than being misread under the new signed
+ *      interpretation.
+ *
+ * ============================================================
+ * All changes from v4_crc retained. New change in that revision:
+ *
+ *  CHANGE 5 ? Dynamic scaling factor (SF) instead of baked-in p_mv:
+ *      stays the ORIGINAL, un-scaled calibration point (in RAM and in
+ *      EEPROM). Only the .sf field is updated for rows with
+ *      ppm >= CALIB_HIGH_PPM (5000) -- exactly as before, sub-5000
+ *      rows are never touched and their sf stays pinned at 1.00.
+ *    - calib_interp() now computes an "effective" centre EMF for every
+ *      row on the fly via calib_eff_mv() = p_mv * sf, and uses that
+ *      value everywhere p_mv used to be used directly (clamping,
+ *      band-snap, interpolation). band_mv itself is never scaled,
+ *      matching the old behaviour exactly. Net predicted ppm for any
+ *      given measured EMF is numerically identical to the old
+ *      "multiply-and-store" approach.
+ *    - New command *RESETCAL# resets sf back to 1.00 on every row of
+ *      both CALIB_FAST and CALIB_AN (p_mv/ppm/band_mv untouched) and
+ *      saves both tables to EEPROM -- one command undoes any number of
+ *      prior *1CAL calls instantly.
+ *    - GET PARAMS calib dump now also prints "eff=" (p_mv * sf) next to
+ *      the raw p_mv and sf for each row, so the currently-active
+ *      calibration point is visible alongside the stored raw one.
+ *
+ * ============================================================
+ * All changes from v4_crc retained. New change in that revision:
+ *
+ *  CHANGE 4 ? Band-based calibration interpolation (mirrors Python v2.9.9):
+ *    - CalibEntry now stores a third field: band_mv (float, ?tolerance).
+ *    - calib_interp() updated to band-aware logic:
+ *        1. If p_val <= first_emf - band0  ? clamp to first ppm
+ *        2. If p_val >= last_emf  + bandN  ? clamp to last ppm
+ *        3. Walk rows: if p_val in [emf-band, emf+band] ? snap to ppm
+ *        4. Otherwise interpolate linearly between upper edge of lower
+ *           band and lower edge of upper band (not centre points).
+ *    - band_mv = 0.0 rows behave identically to the old point interpolation.
+ *    - EEPROM layout updated: each CalibEntry now 9 bytes (was 12).
+ *      New EEPROM address constants defined; old magic values are
+ *      invalidated on first boot ? defaults load cleanly, no corruption.
+ *    - Default tables include band values matching Python DEFAULT_PARAMS.
+ *    - SET CAL / SET ANCAL commands extended to accept optional band_mv.
+ *    - GET PARAMS output includes band column for each calib row.
+ *    - All other engine logic, EEPROM params, MB save/load: UNCHANGED.
+ *
+ * ============================================================
+ * All changes from v3 retained. New change in this revision:
+ *
+ *  CHANGE 3 ? Real CRC-16/IBM in frame output (replaces static 0xAB/0xCD):
+ *    - Added frame_crc16() using the same CRC-16/IBM (Modbus) algorithm
+ *      from the reference Modbus implementation.
+ *    - CRC is computed over the payload bytes only (B02..B08 for data frame,
+ *      B02..B20 for diagnostic frame) ? excludes 0x0A start and 0x0D end.
+ *    - CRC bytes sent lo byte first, then hi byte (same swap as Modbus).
+ *    - tx_send_int32_be() kept for internal use; payload now assembled
+ *      into a buffer first, CRC computed, then transmitted.
+ *
+ * ============================================================
+ * All fixes from v2_fixed retained. New changes from v3:
+ *
+ *  CHANGE 1 ? Warmup state machine rework:
+ *    - Collection window is now hard-fixed at 400 samples
+ *      (independent of P.warmup which is kept for other uses).
+ *    - During the 400-sample collection window: Col 8 = 0.
+ *    - After 400 samples, a separate 50-sample rolling SD window
+ *      (wu_chk_buf) starts. Samples accumulate silently for exactly 50,
+ *      then both conditions are evaluated ONCE:
+ *        condition A: wu_chk_sd() < WARMUP_SD_THRESH   (SD of those 50)
+ *        condition B: no stored MB  OR
+ *                     fabsf(wu_mean() - stored_mother_baseline) <= WARMUP_PROX_MV
+ *      Both must pass to transition directly to WARMUP_RUNNING (Col 8 = 4).
+ *      Either failing keeps Col 8 = 1. The 50-sample window slides so
+ *      a settling signal will eventually pass.
+ *    - wu_mean() (400-sample mean) is used for prox check and baseline seed.
+ *    - *TARE# exits warmup at any point (forces WARMUP_RUNNING).
+ *    - *IGNORE_PROX# still works as before.
+ *
+ *  CHANGE 2 ? *stop# command (one-shot check):
+ *    - On receipt, checks: II == -1.0f AND rec_pct == 100.0f
+ *                          AND or_state == OR_NORMAL
+ *      * Conditions NOT met ? print "BRING PROBE TO AIR / WAIT"
+ *        once, resume normal operation. User must re-issue *stop#.
+ *      * Conditions met     ? save mother_baseline to EEPROM,
+ *        print "OK_STOPPED", set is_running = false,
+ *        loop waiting for *start# (same as initial boot gate).
+ *
+ * 11-Column UART output:
+ *  [1] RefR  [2] EMF_mV  [3] DispPPM  [4] Type  [5] H2_Flag
+ *  [6] Rec_Status  [7] OR_Status  [8] Warmup  [9] PostCnt
+ *  [10] ProbeState  [11] NthMode (F=low-ppm-thresh active, T=normal-thresh active)
+ *
+ * Col 8 Warmup values:
+ *   0 = collecting (first 400 samples)
+ *   1 = SD or prox check failing (was 1+2 previously)
+ *   3 = ready for tare (both checks passed)
+ *   4 = running normally
+ */
+
+/* ------------------------------------------------------------------ */
+/*  COMPILER / HARDWARE SETUP                                          */
+/* ------------------------------------------------------------------ */
+#define F_CPU  3333333UL
+#define USART1_BAUD_RATE(B) ((float)(F_CPU * 64 / (16 *(float)(B))) + 0.5)
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
+#include <avr/sleep.h>
+#include <avr/pgmspace.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* ------------------------------------------------------------------ */
+/*  I2C / ADS122C04 definitions                                        */
+/* ------------------------------------------------------------------ */
+#define I2C_TIMEOUT 10000
+#define I2C_SCL   (1<<0)
+#define I2C_SDA   (1<<1)
+#define I2C_STATE_IS_HIGH(x) ((TWI0.MSTATUS & (x)) == (x))
+#define I2C_STATE_IS_LOW(x)  ((TWI0.MSTATUS & (x)) != (x))
+#define I2C_BUS_STATE        (TWI0.MSTATUS & TWI_BUSSTATE_gm)
+#define I2C_BUS_NOT_IDLE  I2C_STATE_IS_LOW(TWI_BUSSTATE_IDLE_gc)
+#define I2C_BUS_IDLE      I2C_STATE_IS_HIGH(TWI_BUSSTATE_IDLE_gc)
+#define I2C_BUS_NOT_BUSY  I2C_STATE_IS_LOW(TWI_BUSSTATE_BUSY_gc)
+#define I2C_BUS_BUSY      I2C_STATE_IS_HIGH(TWI_BUSSTATE_BUSY_gc)
+#define I2C_BUS_NOT_OWNER I2C_STATE_IS_LOW(TWI_BUSSTATE_OWNER_gc)
+#define I2C_BUS_OWNER     I2C_STATE_IS_HIGH(TWI_BUSSTATE_OWNER_gc)
+#define I2C_NOT_CLOCKHOLD I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)
+#define I2C_CLOCKHOLD     I2C_STATE_IS_HIGH(TWI_CLKHOLD_bm)
+#define I2C_NOT_BUSERR    I2C_STATE_IS_LOW(TWI_BUSERR_bm)
+#define I2C_BUSERR        I2C_STATE_IS_HIGH(TWI_BUSERR_bm)
+#define I2C_NOT_ARBLOST   I2C_STATE_IS_LOW(TWI_ARBLOST_bm)
+#define I2C_ARBLOST       I2C_STATE_IS_HIGH(TWI_ARBLOST_bm)
+#define TWI0_BAUD(F_SCL, T_RISE) \
+    ((((((float)F_CPU/(float)F_SCL))-10-((float)F_CPU*T_RISE/1000000)))/2)
+#define I2C_READ          0x01
+#define I2C_WRITE         0x00
+#define I2C_WAIT_TIMEOUT  512
+#define RETURN_OK         0
+#define RETURN_FAILED     1
+#define RETURN_NO_SLAVE   2
+#define RETURN_BUS_ERROR  3
+#define RETURN_BUS_ARBLOST 4
+#define RETURN_BUS_BUSY   5
+
+#define ADS122C04_ADDR               0x80
+#define ADS122C04_CONVERSION_TIMEOUT 75
+#define ADS122C04_RESET_CMD          0x06
+#define ADS122C04_START_CMD          0x08
+#define ADS122C04_POWERDOWN_CMD      0x02
+#define ADS122C04_RDATA_CMD          0x10
+#define ADS122C04_RREG_CMD           0x20
+#define ADS122C04_WREG_CMD           0x40
+#define ADS122C04_WRITE_CMD(reg)     (ADS122C04_WREG_CMD | (reg << 2))
+#define ADS122C04_READ_CMD(reg)      (ADS122C04_RREG_CMD | (reg << 2))
+#define ADS122C04_CONFIG_0_REG       0
+#define ADS122C04_CONFIG_1_REG       1
+#define ADS122C04_CONFIG_2_REG       2
+#define ADS122C04_CONFIG_3_REG       3
+#define ADS122C04_MUX_AIN1_AIN0      0x3
+#define ADS122C04_GAIN_1             0x0
+#define ADS122C04_PGA_DISABLED       0x1
+#define ADS122C04_DATA_RATE_20SPS    0x0
+#define ADS122C04_DATA_RATE_45SPS    0x1
+#define ADS122C04_DATA_RATE_90SPS    0x2
+#define ADS122C04_DATA_RATE_175SPS   0x3
+#define ADS122C04_DATA_RATE_330SPS   0x4
+#define ADS122C04_DATA_RATE_600SPS   0x5
+#define ADS122C04_DATA_RATE_1000SPS  0x6
+#define ADS122C04_OP_MODE_NORMAL     0x0
+#define ADS122C04_CONVERSION_MODE_SINGLE_SHOT 0x0
+#define ADS122C04_VREF_INTERNAL      0x0
+#define ADS122C04_TEMP_SENSOR_OFF    0x0
+#define ADS122C04_DCNT_DISABLE       0x0
+#define ADS122C04_CRC_DISABLED       0x0
+#define ADS122C04_BURN_OUT_CURRENT_OFF 0x0
+#define ADS122C04_IDAC_CURRENT_OFF   0x0
+#define ADS122C04_IDAC1_DISABLED     0x0
+#define ADS122C04_IDAC2_DISABLED     0x0
+#define ADC_RESET                    PIN7_bm
+
+/* ------------------------------------------------------------------ */
+/*  ADS122C04 register structs                                         */
+/* ------------------------------------------------------------------ */
+struct CONFIG_REG_0 { uint8_t PGA_BYPASS:1; uint8_t GAIN:3; uint8_t MUX:4; };
+union  CONFIG_REG_0_U { uint8_t all; struct CONFIG_REG_0 bit; };
+struct CONFIG_REG_1 { uint8_t TS:1; uint8_t VVREF:2; uint8_t CMBIT:1;
+                      uint8_t MODE:1; uint8_t DR:3; };
+union  CONFIG_REG_1_U { uint8_t all; struct CONFIG_REG_1 bit; };
+struct CONFIG_REG_2 { uint8_t IDAC:3; uint8_t BCS:1; uint8_t CRCbits:2;
+                      uint8_t DCNT:1; uint8_t DRDY:1; };
+union  CONFIG_REG_2_U { uint8_t all; struct CONFIG_REG_2 bit; };
+struct CONFIG_REG_3 { uint8_t RESERVED:2; uint8_t I2MUX:3; uint8_t I1MUX:3; };
+union  CONFIG_REG_3_U { uint8_t all; struct CONFIG_REG_3 bit; };
+typedef struct ADS122C04Reg {
+    union CONFIG_REG_0_U reg0; union CONFIG_REG_1_U reg1;
+    union CONFIG_REG_2_U reg2; union CONFIG_REG_3_U reg3;
+} ADS122C04Reg_t;
+ADS122C04Reg_t ADS122C04_Reg;
+union raw_voltage_union { int32_t INT32; uint32_t UINT32; };
+uint8_t _wireMode = 0x4;
+
+/* ------------------------------------------------------------------ */
+/*  GLOBAL HARDWARE STATE                                              */
+/* ------------------------------------------------------------------ */
+volatile uint32_t millis_count = 0;
+uint8_t  diag_dr   = 0;
+uint8_t  diag_pga  = 0;
+uint8_t  diag_gain = 0;
+uint16_t inter_sample_ms = 50;
+uint16_t drdy_timeout_ms = 75;
+uint8_t  memdata;
+
+static long long raw_sensor_uv       = 0;
+static long long sensor_final_output = 0;
+static long long pub_adc_value       = 0;
+static long long diff_adc_value      = 0;
+
+long long int Reference_Set_Value = 0;
+unsigned int  limit        = 0;
+unsigned char offset_value = 30;
+
+/* ------------------------------------------------------------------ */
+/*  UART RX BUFFER                                                     */
+/* ------------------------------------------------------------------ */
+#define CMD_BUF_LEN 64
+volatile unsigned char company[CMD_BUF_LEN];
+volatile uint8_t       rxcntr    = 0;
+volatile uint8_t       strt      = 0;
+volatile bool          cmd_ready = false;
+
+/* ------------------------------------------------------------------ */
+/*  RUN-GATE STATE                                                     */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    MODE_IDLE       = 0,   /* waiting for *start# or *frame#  */
+    MODE_CONTINUOUS = 1,   /* *start# ? continuous ASCII cols  */
+    MODE_FRAME      = 2,   /* *frame# ? binary frame per sample*/
+} RunMode;
+
+typedef enum {
+    FRAME_DATA = 0,   /* 12-byte data frame  (default)    */
+    FRAME_DIAG = 1,   /* 24-byte diag frame               */
+} FrameType;
+
+static RunMode  run_mode_state = MODE_IDLE;
+static FrameType frame_type    = FRAME_DATA;
+static uint8_t   frame_cn      = 0;   /* wraps 0-255, increments each frame */
+/* Back-compat helper used by do_stop() */
+#define is_running (run_mode_state != MODE_IDLE)
+
+/* ------------------------------------------------------------------ */
+/*  DETECTION ENGINE PARAMETERS                                        */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    float    jmp;
+    float    alp;
+    float    upG;
+    float    inG;
+    float    dnG;
+    float    dnI;
+    float    rec;
+    float    drf;
+    float    n_thresh;
+    uint16_t o_cap;
+    float    rec_zero_pct;
+    uint16_t warmup;
+    float    or_thresh;
+    float    or_exit_mv;
+    float    or_sd_stable;
+    float    daughter_mother_prox;
+    float    post_high_conc_thresh;
+    uint16_t post_high_counter_limit;
+    float    post_high_upG;
+    float    post_high_inG;
+    float    n_thresh_low;       /* n_thresh used when ppm < n_thresh_ppm_thresh */
+    float    n_thresh_ppm_thresh;/* ppm boundary: below ? use n_thresh_low, above ? use n_thresh */
+    /* Legacy scalar config ? migrated from mem_read/mem_write */
+    long     ref_val;      /* replaces mem_read/write(254) */
+    uint16_t limit_val;    /* replaces mem_read/write(6)   */
+    uint8_t  offset_val;   /* replaces mem_read/write(150) */
+    /* One-shot calibration SF cross-concentration step */
+    float    sf_step;      /* per-tier SF divisor step for *1CAL# (default 0.05) */
+    /* Analytical-crossover reset threshold (mV) -- replaces hardcoded #define */
+    float    an_reset_thresh_mv; /* DOWN gate + analytical override threshold (default 20.0) */
+} Params;
+
+static const Params DEFAULT_PARAMS = {
+    .jmp                     = 0.1f,
+    .alp                     = 0.1f,
+    .upG                     = 6.0f,
+    .inG                     = 0.1f,
+    .dnG                     = 6.0f,
+    .dnI                     = -0.1f,
+    .rec                     = 0.8f,
+    .drf                     = 20.0f,
+    .n_thresh                = 0.001f,
+    .o_cap                   = 80,
+    .rec_zero_pct            = 0.05f,
+    .warmup                  = 67,
+    .or_thresh               = 720.0f,
+    .or_exit_mv              = 20.0f,
+    .or_sd_stable            = 0.002f,
+    .daughter_mother_prox    = 2.0f,
+    .post_high_conc_thresh   = 10000.0f,
+    .post_high_counter_limit = 6000,
+    .post_high_upG           = 6.0f,
+    .post_high_inG           = 2.0f,
+    .n_thresh_low            = 0.002f,   /* threshold used when ppm < n_thresh_ppm_thresh */
+    .n_thresh_ppm_thresh     = 3000.0f,  /* boundary: below ? n_thresh_low, above ? n_thresh */
+    .ref_val                 = 0L,
+    .limit_val               = 0u,
+    .offset_val              = 30u,
+    .sf_step                 = 0.05f,
+    .an_reset_thresh_mv      = 50.0f,  /* matches previous hardcoded #define */
+};
+
+static Params P;
+
+/* ------------------------------------------------------------------ */
+/*  WARMUP CONSTANTS                                                   */
+/* ------------------------------------------------------------------ */
+#define WARMUP_COLLECTION_SAMPLES  400u   /* hard-fixed collection window  */
+#define WARMUP_CHECK_SAMPLES        50u   /* rolling SD window after 400   */
+#define WARMUP_SD_THRESH           0.01f
+#define WARMUP_PROX_MV             30.0f
+
+/* ============================================================
+ * >>> ANALYTICAL-CROSSOVER RESET THRESHOLD <<<
+ * ------------------------------------------------------------
+ * When analytical ppm (N_accum / R_ppm) exceeds fast ppm (Q_ppm),
+ * the fast-ppm display is suppressed (latched to 0) for the rest
+ * of that UP event -- analytical takes over the display.
+ *
+ * Also used to gate the DOWN trigger (H vote, col H in Excel):
+ * the DOWN vote is suppressed while the PREVIOUS sample's
+ * analytical value (N_accum) is still >= this threshold (mV).
+ * Mirrors the Python/Excel "N < 20" condition in column H.
+ *
+ * Value is now stored in P.an_reset_thresh_mv (EEPROM, addr 0xE5).
+ * Default = 20.0 mV. Tunable via *SET AN_RESET_THRESH <val>#.
+ * The macro below is kept only as a fallback alias -- do NOT use
+ * it in new code; reference P.an_reset_thresh_mv directly.
+ * ============================================================ */
+#define AN_RESET_THRESH_MV  (P.an_reset_thresh_mv)
+
+
+/* ------------------------------------------------------------------ */
+/*  RAMP / STAB TABLES                                                 */
+/* ------------------------------------------------------------------ */
+typedef struct { float key; float val; } RampEntry;
+
+static const RampEntry RAMP_UP[] = {
+    {-100.0f, 0.0001f}, {40.0f, 0.1f}, {200.0f, 0.1f}, {400.0f, 0.1f},
+};
+#define RAMP_UP_N  4
+
+static const RampEntry RAMP_DN[] = {
+    {-100.0f, -0.00001f}, {40.0f, -0.1f}, {200.0f, -0.2f}, {400.0f, -1.0f},
+};
+#define RAMP_DN_N  4
+
+static const RampEntry STAB_REC[] = {
+    {0.0f,   1.00f}, {0.00001f, 1.00f}, {0.001f, 1.00f}, {0.01f,  0.90f},
+    {0.1f,   0.85f}, {0.25f,   0.67f},  {0.5f,   0.50f}, {0.8f,   0.25f},
+};
+#define STAB_REC_N  8
+
+/* ------------------------------------------------------------------ */
+/*  CALIBRATION TABLES                                                 */
+/* ------------------------------------------------------------------ */
+/* CalibEntry ? 12 bytes in RAM (float + long + float), but stored in EEPROM
+ * as 9 bytes using 3-byte int24 fields (see calib_ee_write/read_entry).
+ * band_mv = 0.0 ? pure interpolation breakpoint (same as old behaviour).
+ * band_mv > 0   ? if p_val in [p_mv - band_mv, p_mv + band_mv] ? snap to ppm. */
+typedef struct { float p_mv; long ppm; float band_mv; float sf; } CalibEntry;
+
+/* Default tables match Python DEFAULT_PARAMS calib / calib_analytical. */
+static const CalibEntry CALIB_FAST_DEFAULT[9] = {
+    {  0.00f,       0,   0.0f,  1.0f},
+    {  0.15f,       5,   0.0f,  1.0f},
+    {  0.40f,      10,   0.0f,  1.0f},
+    {  8.40975f,  100,   1.5f,  1.0f},
+    {100.4988f,  1000,  12.0f,  1.0f},
+    {309.699f,   5000,  10.0f,  1.0f},
+    {411.5075f, 10000,  15.0f,  1.0f},
+    {493.2528f, 20000,  17.0f,  1.0f},
+    {720.0f,   100000,   0.0f,  1.0f},
+};
+static const CalibEntry CALIB_AN_DEFAULT[9] = {
+    {  0.00f,       0,   0.0f,  1.0f},
+    {  0.90f,       5,   0.0f,  1.0f},
+    {  1.40f,      10,   0.0f,  1.0f},
+    { 44.786f,    100,  10.0f,  1.0f},
+    {151.6863f,  1000,   7.0f,  1.0f},
+    {314.3765f,  5000,   7.0f,  1.0f},
+    {415.4543f, 10000,  19.0f,  1.0f},
+    {499.0271f, 20000,  14.0f,  1.0f},
+    {820.0f,   100000,   0.0f,  1.0f},
+};
+
+#define CALIB_N  9
+
+/* ================================================================== */
+/*  CHANGE 13 ? per-ROW-INDEX re-label band for *SETCONC <idx> <ppm>#  */
+/*                                                                     */
+/*  Tolerance for each calibration row index. The band is centred on    */
+/*  that index's FACTORY nominal ppm (CALIB_FAST_DEFAULT[idx].ppm),     */
+/*  NOT on the row's current value, so the window never drifts as the   */
+/*  row is re-labelled again and again:                                 */
+/*      idx 2 (10 ppm)     +/-4     ->      6 ..     14                */
+/*      idx 5 (5000 ppm)   +/-500   ->   4500 ..   5500                */
+/*      idx 6 (10000 ppm)  +/-1000  ->   9000 ..  11000                */
+/*      idx 7 (20000 ppm)  +/-1000  ->  19000 ..  21000                */
+/*      idx 8 (100000 ppm) +/-1000  ->  99000 .. 101000                */
+/*  Tolerance 0 means UNRESTRICTED (rows 0, 1, 3, 4 re-label freely).   */
+/* ================================================================== */
+static const uint16_t CONC_TOL[CALIB_N] = { 0, 0, 4, 0, 0, 500, 1000, 1000, 1000 };
+
+/* Fill *lo / *hi with the allowed ppm window for row idx.
+ * Returns true if the row is banded, false if it is unrestricted. */
+static bool conc_band(uint8_t idx, long *lo, long *hi) {
+    uint16_t tol = CONC_TOL[idx];
+    if (tol == 0) return false;                      /* unrestricted row */
+    long nom = CALIB_FAST_DEFAULT[idx].ppm;          /* factory anchor    */
+    *lo = nom - (long)tol;
+    *hi = nom + (long)tol;
+    return true;
+}
+
+static CalibEntry CALIB_FAST[CALIB_N];
+static CalibEntry CALIB_AN[CALIB_N];
+
+/* EEPROM addresses ? updated for 10-byte CalibEntry (3 bytes p_mv/ppm/band_mv
+ * + 1 byte sf).
+ *
+ * Each CalibEntry column uses 3 bytes (int24), scaled x100 for 2 decimal
+ * places (except ppm which is stored raw as uint24). sf (scaling factor)
+ * is 1 byte.
+ *
+ * CHANGE 7 (this revision) -- sf EEPROM encoding switched from a SIGNED
+ * offset-from-1.00 (step 0.05, range ~ -5.4..7.35) to an UNSIGNED
+ * direct-value encoding (step 0.02, range 0.00..5.10):
+ *   raw = round(sf / 0.02)   ,   sf = raw * 0.02
+ * Reasoning: sf is only ever produced by *1CAL's divisor math
+ * (sf = sf_prev / (1 + steps*P.sf_step) or sf_prev * (1 + steps*P.sf_step)),
+ * which starts from 1.00 and can only multiply/divide -- it can therefore
+ * never legitimately become <= 0. Storing sf directly (instead of an
+ * offset from 1.00) removes the need for a sign bit entirely, which
+ * doubles the usable range at a given step size (old signed/0.05: max
+ * 7.35, worst-case error +-0.025 -- new unsigned/0.02: max 5.10,
+ * worst-case error +-0.01) using the SAME single EEPROM byte -- no
+ * layout change, CALIB_ENTRY_EE_BYTES stays 10. This also fixes the
+ * observed real-world symptom of *1CAL results like sf=0.93 rounding to
+ * 0.95 (or worse) on every power cycle -- error is now capped at 0.01.
+ *   p_mv   : int24,  stored as (int32)(p_mv * 100)   ? 2 decimal places
+ *   ppm    : uint24, stored raw (max 100000 fits in 3 bytes)
+ *   band_mv: int24,  stored as (int32)(band_mv * 100) ? 2 decimal places
+ *   sf     : uint8,  stored as round(sf / 0.02); rows with ppm < 5000
+ *            always stay at raw 50 (sf = 1.00, never scaled)
+ *
+ * Layout (ATtiny3224, 256 bytes EEPROM):
+ *   0x08           FAST magic
+ *   0x09..0x62     FAST data  (9 * 10 = 90 bytes)
+ *   0x63           AN   magic
+ *   0x64..0xBD     AN   data  (9 * 10 = 90 bytes)
+ *   0xBE..0xC1     MB   data  (float, 4 bytes)
+ *   0xC2           MB   magic
+ *   0xC3           PARAMS magic
+ *   0xC4..0xFE     PARAMS data (59 bytes)
+ *   0xFF           unused (1 byte free)
+ *
+ * Magic values bumped so first boot after this firmware upgrade
+ * invalidates old (smaller) EEPROM entries and rewrites defaults cleanly.
+ */
+#define FAST_EE_MAGIC_ADDR    0x08u
+#define FAST_EE_DATA_ADDR     0x09u
+#define AN_EE_MAGIC_ADDR      0x63u
+#define AN_EE_DATA_ADDR       0x64u
+#define MB_EE_DATA_ADDR       0xBEu
+#define MB_EE_MAGIC_ADDR      0xC2u
+#define PARAMS_EE_MAGIC_ADDR  0xC3u
+#define PARAMS_EE_DATA_ADDR   0xC4u
+#define CALIB_EE_MAGIC_VAL    0xAAu   /* CHANGE 7: bumped from 0xA9 ? sf byte reinterpreted as UNSIGNED direct-value (step 0.02), was SIGNED offset-from-1.00 (step 0.05) */
+#define CALIB_EE_MAGIC_INVAL  0x00u
+#define MB_EE_MAGIC_VAL       0xB3u
+#define PARAMS_EE_MAGIC_VAL   0xCCu   /* bumped: several fields repacked to fixed-point to make room for calib sf column */
+#define PARAMS_EE_MAGIC_INVAL 0x00u
+
+
+/* SCALAR block ? ref_val, limit_val, offset_val stored SEPARATELY from the
+ * main params block.  This is the fix for ref/offset becoming 0 after power
+ * cycles:  the old design bundled them at the END of the 89-byte params block,
+ * so every *RF# command had to rewrite all 89 bytes.  A power-loss during that
+ * ~300 ms window left PARAMS_EE_MAGIC = INVAL, causing params_ee_load() to
+ * reset everything including ref_val to DEFAULT (0).
+ *
+ * With a dedicated 8-byte block (magic + ref + limit + offset), the write
+ * window is < 30 ms and they are loaded/saved independently of detection params.
+ *
+ * Layout:
+ *   0x10C   SCALAR magic  (1 byte)
+ *   0x10D   ref_val       (int32, 4 bytes)
+ *   0x111   limit_val     (uint16, 2 bytes)
+ *   0x113   offset_val    (uint8,  1 byte)
+ *   0x114   (next free address)
+ */
+#define SCALAR_EE_MAGIC_ADDR  0x00u
+#define SCALAR_EE_DATA_ADDR   0x01u
+#define SCALAR_EE_MAGIC_VAL   0xD5u
+#define SCALAR_EE_MAGIC_INVAL 0x00u
+
+/* CalibEntry EEPROM encoding helpers.
+ * p_mv, ppm, band_mv are each stored as a 3-byte little-endian integer.
+ * p_mv and band_mv are scaled ?100 (2 decimal places, e.g. 8.40975 ? 841).
+ * ppm is stored raw (unsigned, fits in uint24 for values up to 16,777,215).
+ * sf (scaling factor) is stored as a single SIGNED byte (int8_t):
+ * round((sf-1.0)/0.05), i.e. 0.05 steps starting at 1.00 (raw 0 = sf 1.00,
+ * raw 127 = sf 7.35, raw -128 = sf -5.4). Signed so sf CAN drop below 1.00
+ * -- *1CAL's cross-concentration adjustment can legitimately produce
+ * sf < 1.0, and the old unsigned/clamped-to-0 scheme silently rounded that
+ * back up to sf=1.00 on every EEPROM round-trip (i.e. it "reset" itself on
+ * every power cycle). Rows with ppm < 5000 are never touched by *1CAL and
+ * stay at raw 0 (sf=1.00).
+ */
+#define CALIB_ENTRY_EE_BYTES  10u   /* 3 bytes x 3 fields + 1 byte sf */
+
+/* ------------------------------------------------------------------ */
+/*  EEPROM primitives                                                  */
+/* ------------------------------------------------------------------ */
+static void ee_wb(uint16_t addr, uint8_t val) {
+    eeprom_write_byte((uint8_t*)(uintptr_t)addr, val);
+    while (!eeprom_is_ready()) {}
+}
+static uint8_t ee_rb(uint16_t addr) {
+    return eeprom_read_byte((uint8_t*)(uintptr_t)addr);
+}
+static void ee_write_float(uint16_t addr, float v) {
+    uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) ee_wb((uint16_t)(addr+i), b[i]);
+}
+static float ee_read_float(uint16_t addr) {
+    float v; uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) b[i] = ee_rb((uint16_t)(addr+i));
+    return v;
+}
+static void ee_write_long(uint16_t addr, long v) {
+    uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) ee_wb((uint16_t)(addr+i), b[i]);
+}
+static long ee_read_long(uint16_t addr) {
+    long v; uint8_t *b = (uint8_t*)&v;
+    for (uint8_t i = 0; i < 4; i++) b[i] = ee_rb((uint16_t)(addr+i));
+    return v;
+}
+
+/* ------------------------------------------------------------------ */
+/*  CalibEntry EEPROM encode / decode (9 bytes per entry, 3 per field) */
+/*                                                                      */
+/*  p_mv  : signed int24, stored as round(p_mv * 100)   ? 2 dp        */
+/*  ppm   : unsigned int24, stored raw (fits up to 16,777,215)         */
+/*  band_mv: signed int24, stored as round(band_mv * 100) ? 2 dp      */
+/*                                                                      */
+/*  Value ranges accepted:                                              */
+/*    p_mv    : ?83,886.07 mV  (needed: 0 .. 820 mV ?)                */
+/*    ppm     : 0 .. 16,777,215 (needed: 0 .. 100,000 ?)              */
+/*    band_mv : ?83,886.07 mV  (needed: 0 .. 25.5 mV ?)              */
+/* ------------------------------------------------------------------ */
+static void ee_write_int24(uint16_t addr, int32_t v) {
+    /* Store little-endian 3-byte signed */
+    ee_wb((uint16_t)(addr + 0u), (uint8_t)( v        & 0xFF));
+    ee_wb((uint16_t)(addr + 1u), (uint8_t)((v >>  8) & 0xFF));
+    ee_wb((uint16_t)(addr + 2u), (uint8_t)((v >> 16) & 0xFF));
+}
+static int32_t ee_read_int24(uint16_t addr) {
+    /* Read little-endian 3-byte signed, sign-extend from bit 23 */
+    int32_t v = (int32_t)ee_rb((uint16_t)(addr + 0u))
+              | ((int32_t)ee_rb((uint16_t)(addr + 1u)) << 8)
+              | ((int32_t)ee_rb((uint16_t)(addr + 2u)) << 16);
+    if (v & 0x800000L) v |= (int32_t)0xFF000000L;   /* sign extend */
+    return v;
+}
+static void ee_write_uint24(uint16_t addr, uint32_t v) {
+    ee_wb((uint16_t)(addr + 0u), (uint8_t)( v        & 0xFF));
+    ee_wb((uint16_t)(addr + 1u), (uint8_t)((v >>  8) & 0xFF));
+    ee_wb((uint16_t)(addr + 2u), (uint8_t)((v >> 16) & 0xFF));
+}
+static uint32_t ee_read_uint24(uint16_t addr) {
+    return (uint32_t)ee_rb((uint16_t)(addr + 0u))
+         | ((uint32_t)ee_rb((uint16_t)(addr + 1u)) << 8)
+         | ((uint32_t)ee_rb((uint16_t)(addr + 2u)) << 16);
+}
+
+static void calib_ee_write_entry(uint16_t base, const CalibEntry *e) {
+    ee_write_int24 (base,                  (int32_t)(e->p_mv    * 100.0f + 0.5f));
+    ee_write_uint24((uint16_t)(base + 3u), (uint32_t)e->ppm);
+    ee_write_int24 ((uint16_t)(base + 6u), (int32_t)(e->band_mv * 100.0f + 0.5f));
+    /* CHANGE 7: sf: round(sf/0.02), stored as an UNSIGNED uint8 (0..255),
+     * i.e. sf range 0.00 .. 5.10 in 0.02 steps (was: SIGNED offset-from-1.0,
+     * step 0.05, range ~ -5.4..7.35). sf is only ever produced by *1CAL's
+     * divisor math starting from 1.00 and repeatedly multiplying/dividing
+     * by (1 + steps*P.sf_step) -- it can therefore never legitimately go
+     * <= 0, so storing sf DIRECTLY (no "-1.0" offset, no sign bit needed)
+     * is safe and doubles the effective resolution at the same 1-byte
+     * cost vs the old signed/0.05 scheme (worst-case round-trip error is
+     * now +-0.01 instead of +-0.025). This is what fixes real-world *1CAL
+     * results like sf=0.93 coming back as 0.95 (or worse) after a power
+     * cycle -- previous scheme's coarser 0.05 grid. Old signed EEPROM data
+     * is invalidated automatically by the CALIB_EE_MAGIC_VAL bump above,
+     * so no misread of pre-CHANGE-7 data can occur. */
+    { float raw_f = e->sf / 0.02f;
+      long  raw_i = (long)(raw_f + 0.5f);
+      if (raw_i < 0L)   raw_i = 0L;
+      if (raw_i > 255L) raw_i = 255L;
+      ee_wb((uint16_t)(base + 9u), (uint8_t)raw_i); }
+}
+static void calib_ee_read_entry(uint16_t base, CalibEntry *e) {
+    e->p_mv    = (float)ee_read_int24 (base)                  / 100.0f;
+    e->ppm     = (long) ee_read_uint24((uint16_t)(base + 3u));
+    e->band_mv = (float)ee_read_int24 ((uint16_t)(base + 6u)) / 100.0f;
+    /* CHANGE 7: sf: unsigned raw value * 0.02 -- see calib_ee_write_entry
+     * for full rationale. (Was: 1.0 + signed_raw * 0.05.) */
+    e->sf      = (float)ee_rb((uint16_t)(base + 9u)) * 0.02f;
+}
+
+static void calib_save_all(uint16_t magic_addr, uint16_t data_addr,
+                            CalibEntry *tbl) {
+    ee_wb(magic_addr, CALIB_EE_MAGIC_INVAL);
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        uint16_t base = (uint16_t)(data_addr + (uint16_t)i * CALIB_ENTRY_EE_BYTES);
+        calib_ee_write_entry(base, &tbl[i]);
+    }
+    ee_wb(magic_addr, CALIB_EE_MAGIC_VAL);
+}
+static void calib_save_entry(uint16_t magic_addr, uint16_t data_addr,
+                              CalibEntry *tbl, uint8_t idx) {
+    ee_wb(magic_addr, CALIB_EE_MAGIC_INVAL);
+    uint16_t base = (uint16_t)(data_addr + (uint16_t)idx * CALIB_ENTRY_EE_BYTES);
+    calib_ee_write_entry(base, &tbl[idx]);
+    ee_wb(magic_addr, CALIB_EE_MAGIC_VAL);
+}
+static void calib_load(uint16_t magic_addr, uint16_t data_addr,
+                        CalibEntry *tbl, const CalibEntry *defaults) {
+    if (ee_rb(magic_addr) != CALIB_EE_MAGIC_VAL) {
+        for (uint8_t i = 0; i < CALIB_N; i++) tbl[i] = defaults[i];
+        calib_save_all(magic_addr, data_addr, tbl);
+    } else {
+        for (uint8_t i = 0; i < CALIB_N; i++) {
+            uint16_t base = (uint16_t)(data_addr + (uint16_t)i * CALIB_ENTRY_EE_BYTES);
+            calib_ee_read_entry(base, &tbl[i]);
+        }
+    }
+}
+
+static float stored_mother_baseline = -999999.0f;
+static bool  mother_baseline_valid  = false;
+
+static void mb_ee_save(float mb) {
+    ee_wb(MB_EE_MAGIC_ADDR, 0x00u);
+    ee_write_float(MB_EE_DATA_ADDR, mb);
+    ee_wb(MB_EE_MAGIC_ADDR, MB_EE_MAGIC_VAL);
+}
+static void mb_ee_load(void) {
+    if (ee_rb(MB_EE_MAGIC_ADDR) == MB_EE_MAGIC_VAL) {
+        stored_mother_baseline = ee_read_float(MB_EE_DATA_ADDR);
+        mother_baseline_valid  = true;
+    } else {
+        mother_baseline_valid  = false;
+    }
+}
+
+/* ee_write_u16/ee_read_u16: generic 2-byte little-endian helpers, used
+ * below for the various fixed-point PARAMS fields. */
+static void ee_write_u16(uint16_t addr, uint16_t v) {
+    ee_wb(addr,              (uint8_t)(v & 0xFF));
+    ee_wb((uint16_t)(addr+1),(uint8_t)(v >> 8));
+}
+static uint16_t ee_read_u16(uint16_t addr) {
+    return (uint16_t)(ee_rb(addr) | ((uint16_t)ee_rb((uint16_t)(addr+1)) << 8));
+}
+
+static void params_ee_save(void) {
+    uint16_t a = PARAMS_EE_DATA_ADDR;
+    ee_wb(PARAMS_EE_MAGIC_ADDR, PARAMS_EE_MAGIC_INVAL);
+    ee_write_float(a, P.jmp);            a += 4;
+    ee_write_float(a, P.alp);            a += 4;
+    /* upG/inG/dnG/dnI: uint16/int16 x10 (0.1 precision, range +-3276.7).
+     * Saves 2 bytes each vs float (was 4B, now 2B). */
+    { ee_write_u16(a, (uint16_t)(P.upG * 10.0f + 0.5f)); a += 2; }
+    { ee_write_u16(a, (uint16_t)(P.inG * 10.0f + 0.5f)); a += 2; }
+    { ee_write_u16(a, (uint16_t)(P.dnG * 10.0f + 0.5f)); a += 2; }
+    { int16_t v = (int16_t)(P.dnI * 10.0f + (P.dnI >= 0.0f ? 0.5f : -0.5f));
+      ee_write_u16(a, (uint16_t)v); a += 2; }
+    ee_write_float(a, P.rec);            a += 4;
+    ee_write_float(a, P.drf);            a += 4;
+    /* n_thresh: uint16 x10000 (same style as n_thresh_low). Saves 2 bytes. */
+    { ee_write_u16(a, (uint16_t)(P.n_thresh * 10000.0f + 0.5f)); a += 2; }
+    ee_wb(a,     (uint8_t)(P.o_cap & 0xFF));
+    ee_wb(a + 1, (uint8_t)(P.o_cap >> 8));   a += 2;
+    ee_write_float(a, P.rec_zero_pct);   a += 4;
+    ee_wb(a,     (uint8_t)(P.warmup & 0xFF));
+    ee_wb(a + 1, (uint8_t)(P.warmup >> 8));  a += 2;
+    /* or_thresh: uint16 x10 (0.1 mV precision, range 0..6553.5 mV). Saves 2 bytes. */
+    { ee_write_u16(a, (uint16_t)(P.or_thresh * 10.0f + 0.5f)); a += 2; }
+    ee_write_float(a, P.or_exit_mv);     a += 4;
+    /* or_sd_stable: uint8 x1000000 saves 3 bytes vs float.
+     * default 0.000020 -> stored as 20. range 0.000001..0.000255 */
+    { ee_wb(a, (uint8_t)(P.or_sd_stable * 1000000.0f + 0.5f)); a += 1; }
+    ee_write_float(a, P.daughter_mother_prox); a += 4;
+    /* post_high_conc_thresh: uint24 raw ppm (exact value, up to 16,777,215).
+     * Saves 1 byte vs float. */
+    { ee_write_uint24(a, (uint32_t)(P.post_high_conc_thresh + 0.5f)); a += 3; }
+    ee_wb(a,     (uint8_t)(P.post_high_counter_limit & 0xFF));
+    ee_wb(a + 1, (uint8_t)(P.post_high_counter_limit >> 8)); a += 2;
+    /* post_high_upG / post_high_inG: uint16 x10, same as upG/inG above. */
+    { ee_write_u16(a, (uint16_t)(P.post_high_upG * 10.0f + 0.5f)); a += 2; }
+    { ee_write_u16(a, (uint16_t)(P.post_high_inG * 10.0f + 0.5f)); a += 2; }
+    /* Dynamic threshold fields -- stored as uint16 to save 4 bytes of EEPROM.
+     * n_thresh_low: round(val*10000): 0.002->20, 0.1->1000 (fits uint16).
+     * n_thresh_ppm_thresh: integer ppm, 0..65535 is sufficient. */
+    { uint16_t ntl = (uint16_t)(P.n_thresh_low * 10000.0f + 0.5f);
+      ee_wb(a, (uint8_t)(ntl & 0xFF)); ee_wb(a+1, (uint8_t)(ntl >> 8)); a += 2; }
+    /* n_thresh_ppm_thresh stored as uint8 x100: 3000 -> 30, max 25500 ppm (uint8 max 255*100) */
+    { ee_wb(a, (uint8_t)((uint16_t)P.n_thresh_ppm_thresh / 100u)); a += 1; }
+    /* sf_step stored as uint8 x1000: 0.05 -> 50, range 0.001..0.255 */
+    { ee_wb(a, (uint8_t)(P.sf_step * 1000.0f + 0.5f)); a += 1; }
+    /* an_reset_thresh_mv stored as uint8 raw: range 1..99 mV (addr 0xE5) */
+    { ee_wb(a, (uint8_t)(P.an_reset_thresh_mv + 0.5f)); a += 1; }
+    /* ref_val / limit_val / offset_val are no longer part of this block.
+     * They live in the dedicated SCALAR block (see scalar_ee_save/load). */
+    (void)a;   /* suppress unused-variable warning */
+    ee_wb(PARAMS_EE_MAGIC_ADDR, PARAMS_EE_MAGIC_VAL);
+}
+
+static void params_ee_load(void) {
+    if (ee_rb(PARAMS_EE_MAGIC_ADDR) != PARAMS_EE_MAGIC_VAL) {
+        P = DEFAULT_PARAMS;
+        return;
+    }
+    uint16_t a = PARAMS_EE_DATA_ADDR;
+    P.jmp                  = ee_read_float(a); a += 4;
+    P.alp                  = ee_read_float(a); a += 4;
+    /* upG/inG/dnG/dnI: uint16/int16 x10 (see params_ee_save) */
+    { P.upG = (float)ee_read_u16(a) / 10.0f; a += 2; }
+    { P.inG = (float)ee_read_u16(a) / 10.0f; a += 2; }
+    { P.dnG = (float)ee_read_u16(a) / 10.0f; a += 2; }
+    { int16_t v = (int16_t)ee_read_u16(a); P.dnI = (float)v / 10.0f; a += 2; }
+    P.rec                  = ee_read_float(a); a += 4;
+    P.drf                  = ee_read_float(a); a += 4;
+    /* n_thresh: uint16 x10000 */
+    { P.n_thresh = (float)ee_read_u16(a) / 10000.0f; a += 2; }
+    P.o_cap  = (uint16_t)(ee_rb(a) | ((uint16_t)ee_rb(a+1) << 8)); a += 2;
+    P.rec_zero_pct         = ee_read_float(a); a += 4;
+    P.warmup = (uint16_t)(ee_rb(a) | ((uint16_t)ee_rb(a+1) << 8)); a += 2;
+    /* or_thresh: uint16 x10 */
+    { P.or_thresh = (float)ee_read_u16(a) / 10.0f; a += 2; }
+    P.or_exit_mv           = ee_read_float(a); a += 4;
+    /* or_sd_stable: uint8 x1000000 */
+    { uint8_t sv = ee_rb(a); a += 1;
+      P.or_sd_stable = (sv > 0u) ? ((float)sv / 1000000.0f) : DEFAULT_PARAMS.or_sd_stable; }
+    P.daughter_mother_prox = ee_read_float(a); a += 4;
+    /* post_high_conc_thresh: uint24 raw ppm */
+    { P.post_high_conc_thresh = (float)ee_read_uint24(a); a += 3; }
+    P.post_high_counter_limit =
+        (uint16_t)(ee_rb(a) | ((uint16_t)ee_rb(a+1) << 8)); a += 2;
+    /* post_high_upG / post_high_inG: uint16 x10 */
+    { P.post_high_upG = (float)ee_read_u16(a) / 10.0f; a += 2; }
+    { P.post_high_inG = (float)ee_read_u16(a) / 10.0f; a += 2; }
+    /* Dynamic threshold fields -- loaded from uint16 (see params_ee_save) */
+    { uint16_t ntl = (uint16_t)(ee_rb(a) | ((uint16_t)ee_rb(a+1) << 8)); a += 2;
+      P.n_thresh_low = (float)ntl / 10000.0f; }
+    /* n_thresh_ppm_thresh: uint8 x100 */
+    { P.n_thresh_ppm_thresh = (float)((uint16_t)ee_rb(a) * 100u); a += 1; }
+    /* sf_step: uint8 x1000 */
+    { uint8_t sv = ee_rb(a); a += 1;
+      P.sf_step = (sv > 0u) ? ((float)sv / 1000.0f) : DEFAULT_PARAMS.sf_step; }
+    /* an_reset_thresh_mv: uint8 raw (addr 0xE5); range 1..99 mV */
+    { uint8_t av = ee_rb(a); a += 1;
+      P.an_reset_thresh_mv = (av >= 1u && av <= 99u) ? (float)av : DEFAULT_PARAMS.an_reset_thresh_mv; }
+    (void)a;
+
+    /* ref_val / limit_val / offset_val are loaded from the dedicated SCALAR
+     * block (scalar_ee_load), NOT from this params block.  Do not read them
+     * here ? they were removed to prevent the 89-byte rewrite hazard. */
+
+    /* ----------------------------------------------------------------
+     * Sanity-check detection parameters.
+     * If any critical field is out of range, reset detection params to
+     * defaults.  ref_val / limit_val / offset_val are unaffected because
+     * they are no longer stored in this block.
+     * ---------------------------------------------------------------- */
+    if (P.o_cap == 0 || P.o_cap > 2000 ||
+        P.n_thresh <= 0.0f || P.n_thresh > 1.0f ||
+        P.warmup == 0 || P.warmup > 400) {
+        P = DEFAULT_PARAMS;
+    }
+    /* Sanity-check new fields ? fall back to defaults if corrupt */
+    if (P.n_thresh_low <= 0.0f || P.n_thresh_low > 1.0f)
+        P.n_thresh_low = DEFAULT_PARAMS.n_thresh_low;
+    if (P.n_thresh_ppm_thresh <= 0.0f || P.n_thresh_ppm_thresh > 25500.0f)
+        P.n_thresh_ppm_thresh = DEFAULT_PARAMS.n_thresh_ppm_thresh;
+    if (P.sf_step <= 0.0f || P.sf_step > 0.255f)
+        P.sf_step = DEFAULT_PARAMS.sf_step;
+    if (P.an_reset_thresh_mv < 1.0f || P.an_reset_thresh_mv > 99.0f)
+        P.an_reset_thresh_mv = DEFAULT_PARAMS.an_reset_thresh_mv;
+}
+
+/* ------------------------------------------------------------------ */
+/*  SCALAR EEPROM  ? ref_val / limit_val / offset_val                 */
+/*                                                                      */
+/*  Stored in their own 8-byte block with independent magic so that:   */
+/*  1. Saving them writes only 7 data bytes (~30 ms) ? tiny power-loss */
+/*     window versus the old ~300 ms full-params rewrite.              */
+/*  2. Detection-param corruption / reset never touches these values.   */
+/* ------------------------------------------------------------------ */
+static void scalar_ee_save(void) {
+    uint16_t a = SCALAR_EE_DATA_ADDR;
+    ee_wb(SCALAR_EE_MAGIC_ADDR, SCALAR_EE_MAGIC_INVAL);
+    ee_write_long(a, P.ref_val);                                      a += 4;
+    ee_wb(a,     (uint8_t)(P.limit_val & 0xFF));
+    ee_wb(a + 1, (uint8_t)(P.limit_val >> 8));                        a += 2;
+    ee_wb(a,     P.offset_val);
+    ee_wb(SCALAR_EE_MAGIC_ADDR, SCALAR_EE_MAGIC_VAL);
+}
+static void scalar_ee_load(void) {
+    if (ee_rb(SCALAR_EE_MAGIC_ADDR) != SCALAR_EE_MAGIC_VAL) {
+        /* First boot or EEPROM not yet written ? keep defaults (ref=0, offset=30) */
+        return;
+    }
+    uint16_t a = SCALAR_EE_DATA_ADDR;
+    P.ref_val   = ee_read_long(a);                                     a += 4;
+    P.limit_val = (uint16_t)(ee_rb(a) | ((uint16_t)ee_rb(a+1) << 8)); a += 2;
+    P.offset_val = ee_rb(a);
+    if (P.offset_val > 100) P.offset_val = 30u;
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+static float vlu(float v, const RampEntry *tbl, uint8_t n) {
+    float r = tbl[0].val;
+    for (uint8_t i = 0; i < n; i++) {
+        if (v >= tbl[i].key) r = tbl[i].val; else break;
+    }
+    return r;
+}
+static float vlu_sd(float v, const RampEntry *tbl, uint8_t n) {
+    float r = tbl[0].val;
+    for (uint8_t i = 0; i < n; i++) { if (v >= tbl[i].key) r = tbl[i].val; }
+    return r;
+}
+
+/*
+ * calib_eff_mv ? returns the EFFECTIVE centre EMF for a row, i.e. the
+ * original table p_mv scaled dynamically by that row's sf.
+ *
+ * CHANGE 5 ? Dynamic SF application (replaces "bake sf into p_mv"):
+ * Rows are NEVER pre-multiplied/stored scaled anymore; p_mv in RAM/EEPROM
+ * always holds the original, un-scaled calibration point. sf (1.0 for
+ * every row below CALIB_HIGH_PPM, adjustable via *1CAL for rows >=
+ * CALIB_HIGH_PPM) is applied on the fly, here, every time it's needed.
+ * This produces numerically identical results to the old "bake sf into
+ * p_mv" approach, without ever overwriting the raw calibration point.
+ */
+static inline float calib_eff_mv(const CalibEntry *e) {
+    return e->p_mv * e->sf;
+}
+
+/*
+ * calib_interp ? band-aware calibration, mirrors Python calib_interp().
+ *
+ * Each CalibEntry: p_mv (centre EMF), ppm (target), band_mv (?tolerance).
+ * band_mv == 0.0 ? pure interpolation breakpoint (original behaviour).
+ * The effective centre used throughout is p_mv * sf (see calib_eff_mv) ?
+ * band_mv itself is never scaled, exactly mirroring the old behaviour
+ * where *1CAL only ever scaled p_mv and left band_mv untouched.
+ *
+ * Algorithm:
+ *   1. Clamp low:  p_val <= eff0 - tbl[0].band_mv       ? return tbl[0].ppm
+ *   2. Clamp high: p_val >= effN + tbl[N-1].band_mv      ? return tbl[N-1].ppm
+ *   3. Snap:       for each row, if p_val in [eff-band, eff+band] ? return ppm
+ *   4. Interpolate between adjacent band edges:
+ *        seg_lo = eff_i     + tbl[i].band_mv     (upper edge of row i band)
+ *        seg_hi = eff_{i+1} - tbl[i+1].band_mv   (lower edge of row i+1 band)
+ *        if seg_lo <= p_val <= seg_hi:
+ *            t = (p_val - seg_lo) / (seg_hi - seg_lo)
+ *            return round(ppm_i + t * (ppm_{i+1} - ppm_i))
+ */
+static long calib_interp(float p_val, const CalibEntry *tbl) {
+    /* Step 1/2: clamp at boundaries using band edges around the effective (sf-scaled) centre */
+    float emf0  = calib_eff_mv(&tbl[0]),           band0  = tbl[0].band_mv;
+    float emfN  = calib_eff_mv(&tbl[CALIB_N-1]),   bandN  = tbl[CALIB_N-1].band_mv;
+
+    if (p_val <= emf0 - band0)  return tbl[0].ppm;
+    if (p_val >= emfN + bandN)  return tbl[CALIB_N-1].ppm;
+
+    /* Step 3: snap to ppm if inside any band */
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        float eff = calib_eff_mv(&tbl[i]);
+        float lo = eff - tbl[i].band_mv;
+        float hi = eff + tbl[i].band_mv;
+        if (p_val >= lo && p_val <= hi)
+            return tbl[i].ppm;
+    }
+
+    /* Step 4: interpolate between adjacent band edges */
+    for (uint8_t i = 0; i < CALIB_N - 1u; i++) {
+        float eff_i   = calib_eff_mv(&tbl[i]);
+        float eff_ip1 = calib_eff_mv(&tbl[i+1]);
+        float seg_lo = eff_i   + tbl[i].band_mv;     /* upper edge of row i   */
+        float seg_hi = eff_ip1 - tbl[i+1].band_mv;   /* lower edge of row i+1 */
+        if (p_val >= seg_lo && p_val <= seg_hi) {
+            float span = seg_hi - seg_lo;
+            if (span <= 0.0f) return tbl[i].ppm;
+            float t = (p_val - seg_lo) / span;
+            float interp = (float)tbl[i].ppm + t * (float)(tbl[i+1].ppm - tbl[i].ppm);
+            return (long)(interp + 0.5f);
+        }
+    }
+
+    return tbl[CALIB_N-1].ppm;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ENGINE RING BUFFERS                                                */
+/* ------------------------------------------------------------------ */
+#define C_WIN  7
+static float   c_buf[C_WIN];
+static uint8_t c_head   = 0;
+static uint8_t c_filled = 0;
+
+static void c_push(float v) {
+    c_buf[c_head] = v;
+    c_head = (c_head + 1) % C_WIN;
+    if (c_filled < C_WIN) c_filled++;
+}
+static float c_get(uint8_t k) {
+    int idx = (int)c_head - 1 - (int)k;
+    while (idx < 0) idx += C_WIN;
+    return c_buf[(uint8_t)idx];
+}
+
+#define SD_WIN  6
+static float   sd_buf[SD_WIN];
+static uint8_t sd_head = 0;
+
+static float sd_push(float v) {
+    sd_buf[sd_head] = v;
+    sd_head = (sd_head + 1) % SD_WIN;
+    float sum = 0.0f, mean, var = 0.0f;
+    for (uint8_t i = 0; i < SD_WIN; i++) sum += sd_buf[i];
+    mean = sum / SD_WIN;
+    for (uint8_t i = 0; i < SD_WIN; i++) {
+        float d = sd_buf[i] - mean; var += d * d;
+    }
+    return sqrtf(var / SD_WIN);
+}
+
+/*
+ * Warmup ring buffer ? always sized at WARMUP_COLLECTION_SAMPLES (400).
+ * P.warmup is no longer used to size this buffer.
+ */
+#define WARMUP_BUF_MAX  400
+static float    wu_buf[WARMUP_BUF_MAX];
+static uint16_t wu_head   = 0;
+static uint16_t wu_filled = 0;
+static float    wu_sum    = 0.0f;
+
+static void wu_push(float v) {
+    /* Always use the full 400-sample capacity */
+    if (wu_filled < WARMUP_BUF_MAX) {
+        wu_buf[wu_head] = v;
+        wu_head = (wu_head + 1) % WARMUP_BUF_MAX;
+        wu_filled++;
+        wu_sum += v;
+    } else {
+        wu_sum -= wu_buf[wu_head];
+        wu_buf[wu_head] = v;
+        wu_head = (wu_head + 1) % WARMUP_BUF_MAX;
+        wu_sum += v;
+    }
+}
+static float wu_mean(void) {
+    return (wu_filled > 0) ? wu_sum / (float)wu_filled : 0.0f;
+}
+static float wu_sd(void) __attribute__((unused));
+static float wu_sd(void) {
+    if (wu_filled < 2) return 999.0f;   /* not enough data ? force fail */
+    float mean = wu_sum / (float)wu_filled, var = 0.0f;
+    for (uint16_t i = 0; i < wu_filled; i++)
+        var += (wu_buf[i] - mean) * (wu_buf[i] - mean);
+    return sqrtf(var / (float)wu_filled);
+}
+static void wu_reset(void) { wu_head = 0; wu_filled = 0; wu_sum = 0.0f; }
+
+/* ------------------------------------------------------------------
+ * 50-sample rolling SD buffer used during WARMUP_CHECKING phase.
+ * Separate from wu_buf so the 400-sample mean stays intact for prox
+ * check and baseline seeding.
+ * ------------------------------------------------------------------ */
+static float    wu_chk_buf[WARMUP_CHECK_SAMPLES];
+static uint8_t  wu_chk_head   = 0;
+static uint8_t  wu_chk_filled = 0;
+static float    wu_chk_sum    = 0.0f;
+
+static void wu_chk_push(float v) {
+    /* Non-overlapping window: only accept samples until the 50-slot buffer
+     * is full. Caller must call wu_chk_reset() to start the next window. */
+    if (wu_chk_filled < WARMUP_CHECK_SAMPLES) {
+        wu_chk_buf[wu_chk_head] = v;
+        wu_chk_head = (wu_chk_head + 1) % WARMUP_CHECK_SAMPLES;
+        wu_chk_filled++;
+        wu_chk_sum += v;
+    }
+    /* If already full: silently ignore until reset ? window is evaluated first. */
+}
+static float wu_chk_sd(void) {
+    if (wu_chk_filled < 2) return 999.0f;   /* not enough data ? force fail */
+    float mean = wu_chk_sum / (float)wu_chk_filled, var = 0.0f;
+    for (uint8_t i = 0; i < wu_chk_filled; i++) {
+        float d = wu_chk_buf[i] - mean; var += d * d;
+    }
+    return sqrtf(var / (float)wu_chk_filled);
+}
+static void wu_chk_reset(void) { wu_chk_head = 0; wu_chk_filled = 0; wu_chk_sum = 0.0f; }
+
+/* ------------------------------------------------------------------ */
+/*  DETECTION ENGINE STATE                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * WarmupPhase:
+ *
+ *   WARMUP_COLLECTING : first 400 samples fill wu_buf. Col 8 = 0.
+ *                       SD not evaluated during this phase.
+ *
+ *   WARMUP_CHECKING   : >= 400 samples collected. A separate 50-sample
+ *                       non-overlapping window (wu_chk_buf) is started.
+ *                       Samples accumulate silently until exactly 50 are in,
+ *                       then both conditions are evaluated ONCE:
+ *                         cond_sd   = wu_chk_sd() < WARMUP_SD_THRESH
+ *                         cond_prox = ignore_prox
+ *                                     OR !mother_baseline_valid
+ *                                     OR |wu_mean() - stored_MB| <= WARMUP_PROX_MV
+ *                       Both true  -> _full_reset_state(wu_mean()) -> WARMUP_RUNNING
+ *                       Either false -> wu_chk_reset(), next 50-sample window begins
+ *
+ *   WARMUP_RUNNING    : engine active. Col 8 = 4.
+ *
+ * Two ways to reach WARMUP_RUNNING:
+ *   1. Both SD + prox conditions pass -> _full_reset_state(wu_mean())
+ *   2. User sends *TARE# at any point -> _full_reset_state(C_leaky)
+ */
+typedef enum {
+    WARMUP_COLLECTING = 0,   /* gathering 400 samples     -> Col 8 = 0 */
+    WARMUP_CHECKING   = 1,   /* SD/prox failing, looping  -> Col 8 = 1 */
+    WARMUP_RUNNING    = 4,   /* engine active             -> Col 8 = 4 */
+} WarmupPhase;
+
+typedef enum { OR_NORMAL=0, OR_OVERRANGE, OR_WAIT_DROP, OR_STABLE } OrState;
+
+static uint32_t sample_count      = 0;
+static float    C_leaky           = 0.0f;
+static float    daughter_baseline = 0.0f;
+static float    mother_baseline   = 0.0f;
+static bool     baseline_seeded   = false;
+static uint16_t cnt_D  = 0;
+static float    acc_E  = 0.0f;
+static uint16_t cnt_F  = 0;
+static float    acc_G  = 0.0f;
+static float    II      = -1.0f;
+static float    II_prev = -1.0f;
+static float    J_sd    = 0.0f;
+static float    K_stab  = 0.0f;
+static float    M_delta = 0.0f;
+static float    M_prev  = 0.0f;
+static float    N_accum = 0.0f;
+static uint16_t O_roc   = 0;
+static float    P_clip  = 0.0f;
+static long     Q_ppm   = 0;
+static long     R_ppm   = 0;
+static long     S_ppm   = 0;
+/* Latch: once analytical (R) overtakes fast (Q) during an UP event, keep
+ * fast suppressed (Q displayed as 0) for the rest of that UP event, even
+ * if analytical later falls back below the held fast value. Reset on
+ * UP-entry (II goes 1 after being -1). See AN_RESET_THRESH_MV above. */
+static bool     an_override    = false;
+static float    peak_M         = 0.0f;
+static float    rec_pct        = 100.0f;
+static bool     force_recovered= false;
+static int16_t  tare_blank_count = 0;
+#define TARE_BLANK_SAMPLES  60
+
+static WarmupPhase warmup_phase = WARMUP_COLLECTING;
+static bool        ignore_prox  = false;
+
+static OrState  or_state          = OR_NORMAL;
+static bool     or_seen_overrange = false;
+static bool     or_armed          = false;
+static uint8_t  or_high_count     = 0;
+#define OR_HIGH_REQ  3
+static uint8_t  tare_count        = 0;
+static uint8_t  tare_count_at_or  = 0;
+
+static bool     post_high_active   = false;
+static uint16_t post_high_counter  = 0;
+static bool     post_high_saw_high = false;
+
+/* ------------------------------------------------------------------ */
+/*  UART forward declarations                                          */
+/* ------------------------------------------------------------------ */
+void USART1_sendChar(char c);
+void USART1_sendStr(const char *s);
+void USART1_sendFloat(float v, uint8_t decimals);
+void USART1_sendLong(long v);
+void USART1_sendUInt(uint32_t v);
+void tx_newline(void);
+static void tx_flush(void);
+/* CHANGE 11: set by tx_ack() whenever a handler reports an "ERR..."
+ * result; the process_cmd() wrapper turns it into a frame-mode "ERR"
+ * ack. Reset at the start of every command so it reflects only the
+ * command currently being processed. */
+static bool cmd_failed = false;
+static inline void tx_ack(const char *s);
+
+/* ================================================================== */
+/*  FULL STATE RESET                                                   */
+/*                                                                      */
+/*  post_high_mode controls what happens to the post-high-concentration */
+/*  limiter (post_high_active / post_high_counter / post_high_saw_high) */
+/*  during this reset:                                                  */
+/*    0 = POST_HIGH_RESET  : clear it (original behaviour -- used by    */
+/*                           calibration and warmup-entry resets).      */
+/*    1 = POST_HIGH_KEEP   : leave it exactly as-is, untouched. Used by */
+/*                           TARE while the post-counter is already     */
+/*                           running, so a TARE no longer kicks it out. */
+/*    2 = POST_HIGH_START  : force it active from a clean counter. Used */
+/*                           by TARE when the unit is being taken out   */
+/*                           of an overrange condition, so overrange -> */
+/*                           TARE is a second way into the post-counter,*/
+/*                           alongside the normal ppm-threshold entry.  */
+/* ================================================================== */
+#define POST_HIGH_RESET  0
+#define POST_HIGH_KEEP   1
+#define POST_HIGH_START  2
+
+static void _full_reset_state(float new_base, uint8_t post_high_mode) {
+    daughter_baseline = new_base;
+    mother_baseline   = new_base;
+    baseline_seeded   = true;
+    peak_M            = 0.0f;
+    M_prev            = 0.0f;
+    force_recovered   = true;
+    warmup_phase      = WARMUP_RUNNING;
+    tare_blank_count  = TARE_BLANK_SAMPLES;
+
+    for (uint8_t i = 0; i < C_WIN;  i++) c_buf[i]  = new_base;
+    for (uint8_t i = 0; i < SD_WIN; i++) sd_buf[i]  = new_base;
+    c_head = 0; c_filled = C_WIN;
+    sd_head = 0;
+    J_sd = 0.0f;
+    wu_reset();
+    wu_chk_reset();
+
+    cnt_D = 0;  acc_E = 0.0f;
+    cnt_F = 0;  acc_G = 0.0f;
+    II      = -1.0f;
+    II_prev = -1.0f;
+    N_accum = 0.0f;
+    O_roc   = 0;
+    P_clip  = 0.0f;
+    Q_ppm   = 0; R_ppm = 0; S_ppm = 0;
+    an_override = false;
+    rec_pct = 100.0f;
+    M_delta = 0.0f;
+
+    or_state          = OR_NORMAL;
+    or_seen_overrange = false;
+    or_armed          = false;
+    or_high_count     = 0;
+    tare_count++;
+
+    if (post_high_mode == POST_HIGH_RESET) {
+        post_high_active   = false;
+        post_high_counter  = 0;
+        post_high_saw_high = false;
+    } else if (post_high_mode == POST_HIGH_START) {
+        post_high_active   = true;
+        post_high_counter  = 0;
+        post_high_saw_high = false;
+    }
+    /* POST_HIGH_KEEP: post_high_active / post_high_counter /
+     * post_high_saw_high are intentionally left untouched. */
+
+    mb_ee_save(new_base);
+    stored_mother_baseline = new_base;
+    mother_baseline_valid  = true;
+}
+
+static void do_calibrate(void) { _full_reset_state(C_leaky, POST_HIGH_RESET); tx_ack("OK_CAL\r\n"); }
+
+/* ================================================================== */
+/*  ONE-SHOT CALIBRATION  (*1CAL <ppm>#)                              */
+/*                                                                     */
+/*  Mirrors Python _compute_calibration_preview() + _apply_calibration().*/
+/*                                                                     */
+/*  Algorithm:                                                         */
+/*   1. Use current P_clip (fast DELTA-EMF) and N_accum (anal DELTA-EMF).*/
+/*   2. Look up the existing table EMF at the user-supplied ref ppm.  */
+/*   3. Compute base SF = measured_emf / table_emf_at_ref_ppm.        */
+/*   4. For every row with ppm >= 5000: adjust SF per cross-conc table*/
+/*      using P.sf_step:                                               */
+/*        N steps ABOVE ref -> SF /= (1 + N*sf_step)                  */
+/*        N steps BELOW ref -> SF *= (1 + N*sf_step)                  */
+/*   5. Store adjusted SF into that row's .sf field ONLY -- p_mv is    */
+/*      NEVER modified/baked. calib_interp() multiplies p_mv * sf      */
+/*      dynamically on every lookup instead (see calib_eff_mv()).      */
+/*      Save both tables to EEPROM.                                    */
+/*                                                                     */
+/*  Valid ref ppm tiers: 5000, 10000, 20000, 100000.                  */
+/*  Does NOT alter rows with ppm < 5000 (sub-5k anchor rows: sf stays  */
+/*  pinned at 1.00 always -- see do_reset_cal() for how to force it    */
+/*  back to 1.00 on the high-ppm rows too).                            */
+/*  Does NOT do _full_reset_state() -- this is purely a table update. */
+/*  The old *CAL# command is COMPLETELY UNCHANGED.                     */
+/* ================================================================== */
+
+/* Tier table: 5000, 10000, 20000, 100000 in ascending order */
+static const long CALIB_TIERS[4] = { 5000L, 10000L, 20000L, 100000L };
+#define CALIB_TIERS_N  4
+#define CALIB_HIGH_PPM 5000L   /* rows below this ppm are not scaled */
+
+/* CHANGE 13: tolerance per tier ? the SAME bands *SETCONC allows for the
+ * matching row indices (5,6,7,8), so a re-labelled tier is still found by
+ * *1CAL. Slot indices are unchanged, so the cross-concentration SF-step
+ * math in do_oneshot_calib is byte-identical. */
+static const long CALIB_TIER_TOL[CALIB_TIERS_N] = { 500L, 1000L, 1000L, 1000L };
+
+/* Low tier used by *10CAL: nominal 10 ppm, band +/-4 (6..14). The default
+ * 5 ppm row is OUTSIDE this band, so there is no 5-vs-10 ambiguity. */
+#define CALIB_LOW_NOM  10L
+#define CALIB_LOW_TOL   4L
+
+/* Return tier slot (0-3) whose BAND contains ppm, or -1 if none.
+ * CHANGE 13: band match (was exact ==) so *1CAL keeps working after a
+ * *SETCONC re-label, e.g. tier_idx(5200) and tier_idx(4500) both -> 0. */
+static int8_t tier_idx(long ppm) {
+    for (uint8_t i = 0; i < CALIB_TIERS_N; i++) {
+        long d = ppm - CALIB_TIERS[i];
+        if (d < 0) d = -d;
+        if (d <= CALIB_TIER_TOL[i]) return (int8_t)i;
+    }
+    return -1;
+}
+
+/* Return the p_mv from a table at the exact ref_ppm breakpoint, or -1.0 if not found */
+static float table_emf_at_ppm(const CalibEntry *tbl, long ref_ppm) {
+    for (uint8_t i = 0; i < CALIB_N; i++)
+        if (tbl[i].ppm == ref_ppm) return tbl[i].p_mv;
+    return -1.0f;
+}
+
+static void do_oneshot_calib(long ref_ppm) {
+    /* Allowed in both continuous and frame mode.
+     * In frame mode the calibration executes normally; ASCII responses
+     * are suppressed via tx_ack() so the binary stream is not corrupted. */
+
+    /* Validate ref ppm is one of the four tiers */
+    int8_t ref_i = tier_idx(ref_ppm);
+    if (ref_i < 0) {
+        tx_ack("ERR_1CAL: ppm must be 5000/10000/20000/100000\r\n");
+        return;
+    }
+
+    /* Read current measured DELTA-EMF values:
+     *   P_clip  = fast path (clipped accumulator)  -> mirrors Python P
+     *   N_accum = analytical path (bulk accumulator) -> mirrors Python N
+     * These are valid only when engine is running and signal is UP.
+     * If probe is in AIR (II==-1, rec==100), both will be ~0; warn user.
+     */
+    float fast_emf = P_clip;
+    float anal_emf = N_accum;
+
+    if (fast_emf <= 0.0f || anal_emf <= 0.0f) {
+        tx_ack("ERR_1CAL: no valid DELTA-EMF (expose sensor to ref gas first)\r\n");
+        return;
+    }
+
+    /* Look up existing table EMF at ref ppm */
+    float fast_ref_emf = table_emf_at_ppm(CALIB_FAST, ref_ppm);
+    float anal_ref_emf = table_emf_at_ppm(CALIB_AN,   ref_ppm);
+
+    if (fast_ref_emf <= 0.0f) {
+        tx_ack("ERR_1CAL: ref ppm not in FAST table\r\n");
+        return;
+    }
+    if (anal_ref_emf <= 0.0f) {
+        tx_ack("ERR_1CAL: ref ppm not in AN table\r\n");
+        return;
+    }
+
+    /* Base scale factors */
+    float sf_fast_base = fast_emf / fast_ref_emf;
+    float sf_anal_base = anal_emf / anal_ref_emf;
+
+    /* Apply cross-concentration SF adjustment and scale tables.
+     * CALIB_FAST and CALIB_AN share the same ppm layout, so one loop
+     * covers both tables.  AN rows are looked up by ppm, not by index,
+     * to be safe against any future layout divergence.
+     */
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        /* ---- Fast table row i ---- */
+        /* CHANGE 13: scale a row if it is a legacy high row (>=5000) OR now
+         * falls in any tier band ? covers a tier re-labelled below 5000. */
+        if (CALIB_FAST[i].ppm >= CALIB_HIGH_PPM || tier_idx(CALIB_FAST[i].ppm) >= 0) {
+            int8_t tgt_i = tier_idx(CALIB_FAST[i].ppm);
+            float sf_f;
+            if (tgt_i < 0) {
+                sf_f = sf_fast_base;  /* non-tier row: use base SF */
+            } else {
+                int8_t steps = tgt_i - ref_i;
+                float steps_abs = (steps < 0) ? -(float)steps : (float)steps;
+                float divisor = 1.0f + steps_abs * P.sf_step;
+                sf_f = (steps > 0) ? sf_fast_base / divisor
+                      :(steps < 0) ? sf_fast_base * divisor
+                      : sf_fast_base;
+            }
+            /* CHANGE 5: do NOT bake sf into p_mv anymore -- p_mv stays the
+             * original, un-scaled calibration point forever. Only sf is
+             * updated; calib_interp() applies it dynamically at lookup
+             * time (p_mv * sf). Net effect on predicted ppm is identical. */
+            CALIB_FAST[i].sf    = sf_f;
+        }
+        /* ---- Analytical table row i ---- */
+        if (CALIB_AN[i].ppm >= CALIB_HIGH_PPM || tier_idx(CALIB_AN[i].ppm) >= 0) {
+            int8_t tgt_i = tier_idx(CALIB_AN[i].ppm);
+            float sf_a;
+            if (tgt_i < 0) {
+                sf_a = sf_anal_base;
+            } else {
+                int8_t steps = tgt_i - ref_i;
+                float steps_abs = (steps < 0) ? -(float)steps : (float)steps;
+                float divisor = 1.0f + steps_abs * P.sf_step;
+                sf_a = (steps > 0) ? sf_anal_base / divisor
+                      :(steps < 0) ? sf_anal_base * divisor
+                      : sf_anal_base;
+            }
+            /* CHANGE 5: p_mv left untouched -- see FAST-table comment above. */
+            CALIB_AN[i].sf    = sf_a;
+        }
+    }
+
+    /* Save both tables to EEPROM atomically */
+    calib_save_all(FAST_EE_MAGIC_ADDR, FAST_EE_DATA_ADDR, CALIB_FAST);
+    calib_save_all(AN_EE_MAGIC_ADDR,   AN_EE_DATA_ADDR,   CALIB_AN);
+
+    /* Report result.
+     * Called from inside process_cmd() which already holds rx_disable().
+     * Do NOT call rx_disable()/rx_enable() here -- the caller owns them. */
+    if (run_mode_state != MODE_FRAME) {
+        USART1_sendStr("OK_1CAL ref="); USART1_sendLong(ref_ppm);
+        USART1_sendStr("ppm SFf="); USART1_sendFloat(sf_fast_base, 5);
+        USART1_sendStr(" SFa="); USART1_sendFloat(sf_anal_base, 5);
+        USART1_sendStr(" step="); USART1_sendFloat(P.sf_step, 4);
+        USART1_sendStr("\r\n");
+    }
+}
+
+/* ================================================================== */
+/*  RESET CALIBRATION SCALING FACTOR  (*RESETCAL#)                    */
+/*                                                                     */
+/*  Sets sf = 1.00 on every row of BOTH CALIB_FAST and CALIB_AN, then  */
+/*  saves both tables to EEPROM. p_mv, ppm, band_mv are left           */
+/*  completely untouched (they are never altered by *1CAL either).     */
+/*  Since calib_interp() always multiplies p_mv * sf on the fly, this  */
+/*  instantly and fully undoes every *1CAL scaling adjustment without  */
+/*  needing to know or restore any original p_mv values.               */
+/* ================================================================== */
+static void do_reset_cal(void) {
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        CALIB_FAST[i].sf = 1.0f;
+        CALIB_AN[i].sf   = 1.0f;
+    }
+    calib_save_all(FAST_EE_MAGIC_ADDR, FAST_EE_DATA_ADDR, CALIB_FAST);
+    calib_save_all(AN_EE_MAGIC_ADDR,   AN_EE_DATA_ADDR,   CALIB_AN);
+    tx_ack("OK_RESETCAL\r\n");
+}
+
+/* ================================================================== */
+/*  10 PPM ONE-SHOT CALIBRATION  (*10CAL#)                           */
+/*                                                                     */
+/*  Updates ONLY the 10 ppm row in both CALIB_FAST and CALIB_AN.     */
+/*  No scaling factor, no cross-concentration adjustment, nothing     */
+/*  else is touched.                                                   */
+/*                                                                     */
+/*  Algorithm:                                                         */
+/*   1. Use current P_clip (fast DELTA-EMF) and N_accum (anal DELTA-EMF).*/
+/*   2. Find the row with ppm == 10 in each table.                    */
+/*   3. Set that row's p_mv = measured DELTA-EMF directly.            */
+/*   4. Save only those two rows to EEPROM.  All other rows, band_mv, */
+/*      ppm values, and parameters are COMPLETELY UNCHANGED.           */
+/* ================================================================== */
+static void do_10ppm_calib(void) {
+    /* Allowed in both continuous and frame mode.
+     * In frame mode the calibration executes normally; ASCII responses
+     * are suppressed via tx_ack() so the binary stream is not corrupted. */
+
+    /* Read current measured DELTA-EMF values */
+    float fast_emf = P_clip;
+    float anal_emf = N_accum;
+
+    if (fast_emf <= 0.0f || anal_emf <= 0.0f) {
+        tx_ack("ERR_10CAL: no valid DELTA-EMF (expose sensor to 10ppm gas first)\r\n");
+        return;
+    }
+
+    /* CHANGE 13: find the row NEAREST nominal 10 ppm within the low band
+     * (6..14), instead of an exact ppm==10 match, so *10CAL still works
+     * after e.g. *SETCONC 2 8#. The 5 ppm row is outside the band, so the
+     * default table resolves to row 2 exactly as the old match did. */
+    int8_t fast_idx = -1, an_idx = -1;
+    long best_f = 0x7FFFFFFFL, best_a = 0x7FFFFFFFL;
+    for (uint8_t i = 0; i < CALIB_N; i++) {
+        long df = CALIB_FAST[i].ppm - CALIB_LOW_NOM; if (df < 0) df = -df;
+        if (df <= CALIB_LOW_TOL && df < best_f) { best_f = df; fast_idx = (int8_t)i; }
+        long da = CALIB_AN[i].ppm   - CALIB_LOW_NOM; if (da < 0) da = -da;
+        if (da <= CALIB_LOW_TOL && da < best_a) { best_a = da; an_idx   = (int8_t)i; }
+    }
+
+    if (fast_idx < 0) {
+        tx_ack("ERR_10CAL: 10ppm row not found in FAST table\r\n");
+        return;
+    }
+    if (an_idx < 0) {
+        tx_ack("ERR_10CAL: 10ppm row not found in AN table\r\n");
+        return;
+    }
+
+    /* Store old values for the report */
+    float old_fast_mv = CALIB_FAST[fast_idx].p_mv;
+    float old_an_mv   = CALIB_AN[an_idx].p_mv;
+
+    /* Update ONLY the p_mv of the 10 ppm row -- ppm and band_mv stay unchanged */
+    CALIB_FAST[fast_idx].p_mv = fast_emf;
+    CALIB_AN[an_idx].p_mv     = anal_emf;
+
+    /* Save ONLY these two individual rows to EEPROM */
+    calib_save_entry(FAST_EE_MAGIC_ADDR, FAST_EE_DATA_ADDR, CALIB_FAST, (uint8_t)fast_idx);
+    calib_save_entry(AN_EE_MAGIC_ADDR,   AN_EE_DATA_ADDR,   CALIB_AN,   (uint8_t)an_idx);
+
+    /* Report result (suppressed in frame mode to protect binary stream) */
+    if (run_mode_state != MODE_FRAME) {
+        USART1_sendStr("OK_10CAL fast_old="); USART1_sendFloat(old_fast_mv, 4);
+        USART1_sendStr("mV fast_new=");       USART1_sendFloat(fast_emf, 4);
+        USART1_sendStr("mV an_old=");         USART1_sendFloat(old_an_mv, 4);
+        USART1_sendStr("mV an_new=");         USART1_sendFloat(anal_emf, 4);
+        USART1_sendStr("mV\r\n");
+    }
+}
+
+/*
+ * do_tear() ? exits warmup immediately regardless of phase,
+ * forces WARMUP_RUNNING via _full_reset_state().
+ *
+ * Post-high-concentration limiter behaviour on TARE (per new spec):
+ *   1. If the post-counter is ALREADY running (post_high_active==true),
+ *      TARE must NOT kick it out anymore -- every other TARE side effect
+ *      (baseline reset, warmup restart, OR-state reset, blanking window,
+ *      etc.) still happens as normal, only the post-counter itself is
+ *      left running untouched -> POST_HIGH_KEEP.
+ *   2. Else, if the unit is currently anywhere in the overrange sequence
+ *      (or_state != OR_NORMAL -- OVERRANGE / WAIT_DROP / STABLE) then this
+ *      TARE is the user bringing the unit OUT of overrange, and that is
+ *      now a second way into the post-counter (in addition to the normal
+ *      ppm-threshold entry in engine_step()) -> POST_HIGH_START.
+ *   3. Otherwise this is an ordinary TARE with no post-counter in play ->
+ *      POST_HIGH_RESET (original behaviour).
+ *
+ * NOTE: these checks must happen BEFORE _full_reset_state() runs, since
+ * that call itself clears or_state back to OR_NORMAL.
+ */
+static void do_tear(void) {
+    uint8_t post_high_mode;
+
+    if (post_high_active) {
+        post_high_mode = POST_HIGH_KEEP;
+    } else if (or_state != OR_NORMAL) {
+        post_high_mode = POST_HIGH_START;
+    } else {
+        post_high_mode = POST_HIGH_RESET;
+    }
+
+    _full_reset_state(C_leaky, post_high_mode);
+    tx_ack("OK_TEAR\r\n");
+}
+
+/* ================================================================== */
+/*  DETECTION ENGINE  ?  one sample step                              */
+/* ================================================================== */
+static void engine_step(float emf_val) {
+    sample_count++;
+
+    if (sample_count == 1) {
+        C_leaky = emf_val;
+        for (uint8_t i = 0; i < C_WIN;  i++) c_buf[i]  = emf_val;
+        for (uint8_t i = 0; i < SD_WIN; i++) sd_buf[i]  = emf_val;
+        c_head = 0; c_filled = C_WIN; sd_head = 0;
+        if (!baseline_seeded) { daughter_baseline = emf_val; mother_baseline = emf_val; }
+        M_delta = emf_val - daughter_baseline;
+        M_prev  = 0.0f; II_prev = II;
+        wu_push(emf_val);
+        return;
+    }
+
+    /* Leaky integrator */
+    float C_prev = C_leaky;
+    if (fabsf(emf_val - C_prev) > P.jmp)
+        C_leaky = emf_val;
+    else
+        C_leaky = (emf_val - C_prev) * P.alp + C_prev;
+
+    c_push(C_leaky);
+    J_sd = sd_push(C_leaky);
+
+    /* OR state machine */
+    if (or_state != OR_NORMAL) {
+        if (tare_count_at_or != tare_count) {
+            or_state = OR_NORMAL; or_seen_overrange = false;
+            or_armed = false; or_high_count = 0;
+        }
+    }
+    if (emf_val > P.or_thresh) {
+        or_high_count++;
+        if (or_high_count >= OR_HIGH_REQ) or_armed = true;
+    } else {
+        or_high_count = 0;
+    }
+    switch (or_state) {
+        case OR_NORMAL:
+            or_seen_overrange = false;
+            if (emf_val > P.or_thresh && or_armed) {
+                or_state = OR_OVERRANGE; or_seen_overrange = true;
+                tare_count_at_or = tare_count;
+            }
+            break;
+        case OR_OVERRANGE:
+            if (emf_val < P.or_exit_mv) or_state = OR_WAIT_DROP;
+            break;
+        case OR_WAIT_DROP:
+            if (!or_armed) { /* blocked */ }
+            else if (emf_val > P.or_thresh) {
+                or_state = OR_OVERRANGE; or_seen_overrange = true;
+                tare_count_at_or = tare_count;
+            } else if (emf_val < P.or_exit_mv) {
+                if (J_sd < P.or_sd_stable && or_seen_overrange && or_armed)
+                    or_state = OR_STABLE;
+            }
+            break;
+        case OR_STABLE:
+            if (emf_val > P.or_thresh) {
+                or_state = OR_OVERRANGE; or_seen_overrange = true;
+                tare_count_at_or = tare_count;
+            }
+            break;
+    }
+    bool in_or = (or_state != OR_NORMAL);
+
+    /* ----------------------------------------------------------------
+     * WARMUP STATE MACHINE ? two-phase
+     *
+     * Phase 1: WARMUP_COLLECTING
+     *   Push every clean (non-OR) sample into wu_buf (400-sample ring).
+     *   Stay here until wu_filled reaches WARMUP_COLLECTION_SAMPLES.
+     *   Col 8 = 0 throughout.
+     *
+     * Phase 2: WARMUP_CHECKING  (entered once 400 samples collected)
+     *   A fresh 50-sample non-overlapping window (wu_chk_buf) is started.
+     *   Samples accumulate silently until wu_chk_filled == 50.
+     *   At exactly 50 samples both conditions are evaluated ONCE:
+     *     cond_sd   = wu_chk_sd() < WARMUP_SD_THRESH   (SD of those 50)
+     *     cond_prox = ignore_prox
+     *                 OR !mother_baseline_valid
+     *                 OR |wu_mean() - stored_MB| <= WARMUP_PROX_MV
+     *   Both true  -> _full_reset_state(wu_mean()) -> WARMUP_RUNNING
+     *   Either false -> wu_chk_reset() starts the NEXT 50-sample window
+     *                   (samples 450-500, 500-550, etc.)
+     *
+     * Windows:  400-450 ? eval ? fail ? 450-500 ? eval ? pass ? RUNNING
+     *
+     * *TARE# at ANY phase -> _full_reset_state(C_leaky) -> WARMUP_RUNNING.
+     * ---------------------------------------------------------------- */
+    if (!baseline_seeded && !in_or) {
+        wu_push(C_leaky);   /* always keep the 400-sample mean up to date */
+
+        if (warmup_phase == WARMUP_COLLECTING) {
+            /* Stay collecting until 400 samples gathered */
+            if (wu_filled >= WARMUP_COLLECTION_SAMPLES) {
+                warmup_phase = WARMUP_CHECKING;
+                wu_chk_reset();   /* start the 50-sample check window fresh */
+                /* fall through to WARMUP_CHECKING this same sample */
+            }
+        }
+
+        if (warmup_phase == WARMUP_CHECKING) {
+            wu_chk_push(C_leaky);   /* accumulate into current 50-sample window */
+
+            /* Only evaluate once the window is exactly full */
+            if (wu_chk_filled == WARMUP_CHECK_SAMPLES) {
+                float sd_now   = wu_chk_sd();
+                float mean_now = wu_mean();
+
+                bool cond_sd   = (sd_now < WARMUP_SD_THRESH);
+                bool cond_prox = ignore_prox
+                                 || !mother_baseline_valid
+                                 || (fabsf(mean_now - stored_mother_baseline) <= WARMUP_PROX_MV);
+
+                if (cond_sd && cond_prox) {
+                    /* Both conditions met ? transition to RUNNING */
+                    _full_reset_state(mean_now, POST_HIGH_RESET);
+                } else {
+                    /* Fail ? discard this window, start collecting the next 50 */
+                    wu_chk_reset();
+                }
+            }
+            /* While wu_chk_filled < 50: accumulating silently, no evaluation. */
+        }
+    }
+
+    bool in_warmup_phase = (warmup_phase != WARMUP_RUNNING);
+
+    /* Gate ? same as before */
+    if (in_or || sample_count < 7 || in_warmup_phase) {
+        II_prev = II;
+        M_delta = C_leaky - daughter_baseline;
+        return;
+    }
+
+    /* c6, cp1 */
+    float c6  = (c_filled >= 7) ? c_get(6) : c_get(c_filled - 1);
+    float cp1 = c_get(1);
+
+    /* D, E */
+    float ru_thr = vlu(C_leaky, RAMP_UP, RAMP_UP_N);
+    if ((C_leaky - cp1) > ru_thr) { cnt_D++; acc_E += (C_leaky - c6); }
+    else { cnt_D = 0; acc_E = 0.0f; }
+
+    /* Post-high "large leaks only" checkpoint reset (UP side only).
+     * OVERWRITES the previous post_high logic, which substituted
+     * post_high_upG/post_high_inG directly in place of upG/inG for the
+     * whole duration of post_high_active -- that swap made the UP gate
+     * *permanently* easier or harder to trip depending on the values
+     * chosen, for as long as the counter ran.
+     *
+     * This replacement instead leaves upG/inG completely untouched at
+     * all times. While post_high_active is running, once the up-counter
+     * cnt_D reaches post_high_upG samples, the accumulated intensity
+     * acc_E must already exceed post_high_inG, or this ramp is judged
+     * too weak to be a large leak -- cnt_D/acc_E are force-reset to 0 so
+     * the counter must start over from scratch. A genuinely strong/fast
+     * ramp will have cleared post_high_inG by that checkpoint and is left
+     * alone, so it still confirms normally against the real upG/inG gate
+     * below. This is a single checkpoint test, not a threshold swap. */
+    if (post_high_active) {
+        if ((float)cnt_D >= P.post_high_upG && acc_E < P.post_high_inG) {
+            cnt_D = 0;
+            acc_E = 0.0f;
+        }
+    }
+
+    /* FF, G */
+    float rd_thr = vlu(C_leaky, RAMP_DN, RAMP_DN_N);
+    if ((C_leaky - c6) < rd_thr) { cnt_F++; acc_G += (C_leaky - c6); }
+    else { cnt_F = 0; acc_G = 0.0f; }
+
+    /* H vote ? II. upG/inG are always the real, unmodified thresholds --
+     * the post-high checkpoint above (not a threshold swap) is what limits
+     * detection during the large-leaks-only window. */
+    int8_t h = 0;
+    if ((float)cnt_D > P.upG && acc_E > P.inG) h += 1;
+    /* Down trigger suppressed when previous N_accum (analytical) >=
+     * AN_RESET_THRESH_MV -- mirrors Excel col H change (N<20 condition). */
+    if ((float)cnt_F > P.dnG   && acc_G < P.dnI && N_accum < AN_RESET_THRESH_MV) h -= 1;
+    II_prev = II;
+    if (h != 0) II = (float)h;
+
+    /* K */
+    K_stab = (II == 1.0f) ? 0.0f : vlu_sd(J_sd, STAB_REC, STAB_REC_N);
+
+    /* Baseline update */
+    {
+        float c_now = C_leaky, l;
+        if (c_now < mother_baseline) { mother_baseline = c_now; l = c_now; }
+        else {
+            if (K_stab >= P.rec && fabsf(c_now - mother_baseline) < P.drf) l = c_now;
+            else l = daughter_baseline;
+        }
+        if (fabsf(l - mother_baseline) <= P.daughter_mother_prox) mother_baseline = l;
+        daughter_baseline = l;
+    }
+    M_delta = C_leaky - daughter_baseline;
+
+    /* peak_M */
+    if (II == -1.0f && II_prev == 1.0f) peak_M = fabsf(M_prev);
+
+    /* N accumulator */
+    /* Dynamic threshold: use n_thresh_low when the previous displayed ppm is below
+     * n_thresh_ppm_thresh (default 3000 ppm), else use the normal n_thresh.
+     * S_ppm holds the previous sample's displayed ppm (updated later this step). */
+    float eff_n_thresh = (S_ppm < (long)P.n_thresh_ppm_thresh) ? P.n_thresh_low : P.n_thresh;
+    float n_val;
+    if (II == 1.0f && II_prev == -1.0f) {
+        n_val = M_delta;
+    } else if (II == 1.0f) {
+        float delta_m = M_delta - M_prev;
+        n_val = (M_delta > 0.0f && fabsf(delta_m) > eff_n_thresh * M_delta) ? M_delta : N_accum;
+    } else {
+        n_val = 0.0f;
+    }
+    N_accum = n_val;
+
+    /* O ROC counter */
+    uint16_t O_prev = O_roc;
+    if (II > 0.0f)
+        O_roc = (O_prev >= P.o_cap) ? P.o_cap : (uint16_t)(O_prev + 1u);
+    else
+        O_roc = 0;
+
+    /* P_clip */
+    float pv;
+    if      (O_roc == 0)       pv = 0.0f;
+    else if (O_roc == O_prev)  pv = P_clip;
+    else                       pv = N_accum;
+    P_clip = pv;
+
+    /* Q, R, S */
+    long q_val = calib_interp(P_clip,  CALIB_FAST);
+    long r_val = calib_interp(N_accum, CALIB_AN);
+
+    /* Latch: once analytical (r_val) overtakes fast (q_val) during an UP
+     * event, display r_val only for the rest of that UP event -- even if
+     * r_val later falls back below q_val. Latch resets on DOWN (II==-1)
+     * so the next UP event starts fresh. q_val is never zeroed; only the
+     * display variable s_val is switched. Mirrors Python v15 logic. */
+    if (II == -1.0f) {
+        an_override = false;          /* reset latch when DOWN state reached */
+    }
+    if (II == 1.0f && (float)r_val > (float)q_val) {
+        an_override = true;           /* latch on first crossover in UP event */
+    }
+    long s_val = an_override ? r_val : q_val;
+
+    /* Blanking window after TARE */
+    if (tare_blank_count > 0) {
+        tare_blank_count--;
+        N_accum = 0.0f; O_roc = 0; P_clip = 0.0f;
+        q_val = 0; r_val = 0; s_val = 0;
+    }
+    Q_ppm = q_val; R_ppm = r_val; S_ppm = s_val;
+
+    /* Recovery % */
+    if (force_recovered) {
+        rec_pct = 100.0f; force_recovered = false; peak_M = 0.0f;
+    } else if (II == -1.0f && II_prev == 1.0f) {
+        peak_M = fabsf(M_prev); rec_pct = 100.0f;
+    } else if (II == -1.0f && peak_M > 0.0f) {
+        float abs_m = fabsf(M_delta);
+        if (abs_m < P.rec_zero_pct * peak_M) { rec_pct = 100.0f; }
+        else {
+            float r = (1.0f - abs_m / peak_M) * 100.0f;
+            if (r < 0.0f) r = 0.0f; if (r > 99.9f) r = 99.9f;
+            rec_pct = r;
+        }
+    } else if (II == 1.0f) { rec_pct = 0.0f; }
+
+    /* Post-high-concentration limiting */
+    {
+        int8_t disp_flag;
+        if      (II == 1.0f)                            disp_flag =  1;
+        else if (II == -1.0f && II_prev == 1.0f)        disp_flag = -2;
+        else if (II == -1.0f && rec_pct < 100.0f)       disp_flag = -3;
+        else                                             disp_flag = -1;
+
+        if (post_high_active) {
+            if (disp_flag == 1 && S_ppm >= (long)P.post_high_conc_thresh)
+                post_high_saw_high = true;
+            if (post_high_saw_high &&
+                (disp_flag == -2 || disp_flag == -3 || disp_flag == -1)) {
+                post_high_counter  = 0;
+                post_high_saw_high = false;
+            }
+            post_high_counter++;
+            if (post_high_counter >= P.post_high_counter_limit) {
+                post_high_active   = false;
+                post_high_counter  = 0;
+                post_high_saw_high = false;
+            }
+        } else {
+            if (disp_flag == 1 && S_ppm >= (long)P.post_high_conc_thresh)
+                post_high_saw_high = true;
+            if (post_high_saw_high &&
+                (disp_flag == -2 || disp_flag == -3 || disp_flag == -1)) {
+                post_high_active   = true;
+                post_high_counter  = 0;
+                post_high_saw_high = false;
+            }
+        }
+    }
+
+    M_prev = M_delta;
+}
+
+/* ================================================================== */
+/*  I2C DRIVER                                                         */
+/* ================================================================== */
+bool I2C_RawStart(uint8_t deviceAddr, uint8_t Direction) {
+    volatile uint16_t timeout;
+    deviceAddr = deviceAddr | Direction;
+    if (I2C_BUS_NOT_BUSY) {
+        for (volatile uint16_t arbLoop = 0x04; arbLoop > 0; arbLoop--) {
+            TWI0.MADDR = deviceAddr;
+            if (Direction)
+            { for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_RIF_bm)&&(timeout>0); timeout--){} }
+            else
+            { for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_WIF_bm)&&(timeout>0); timeout--){} }
+            if (I2C_ARBLOST) continue;
+            if (I2C_BUSERR)  return(RETURN_BUS_ERROR);
+            if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) return(RETURN_OK);
+            else                                return(RETURN_NO_SLAVE);
+        }
+    } else return(RETURN_BUS_BUSY);
+    return(RETURN_BUS_ARBLOST);
+}
+bool I2C_RawStop(void) {
+    volatile uint16_t timeout;
+    for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)&&(timeout>0); timeout--){}
+    if (timeout==0) return(RETURN_FAILED);
+    TWI0.MCTRLB = TWI_ACKACT_NACK_gc | TWI_MCMD_STOP_gc;
+    for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)&&(timeout>0); timeout--){}
+    if (I2C_BUSERR) TWI0.MSTATUS = TWI_BUSERR_bm;
+    return(RETURN_OK);
+}
+void I2C_RawForceStop(void) {
+    I2C_RawStop(); TWI0.MSTATUS |= TWI_BUSSTATE_IDLE_gc; TWI0.MCTRLB |= TWI_FLUSH_bm;
+}
+bool I2C_RawWrite(uint8_t write_data) {
+    volatile uint16_t timeout;
+    if (I2C_BUS_OWNER) {
+        for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)&&(timeout>0); timeout--){}
+        if (timeout==0) return(RETURN_FAILED);
+        TWI0.MDATA = write_data;
+        for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_WIF_bm)&&(timeout>0); timeout--){}
+        if (I2C_BUSERR) return(RETURN_BUS_ERROR);
+        if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) return(RETURN_OK);
+        else return(RETURN_NO_SLAVE);
+    }
+    return(RETURN_FAILED);
+}
+bool I2C_RawRead(uint8_t ACK) {
+    volatile uint16_t timeout;
+    if (I2C_BUS_OWNER) {
+        for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_CLKHOLD_bm)&&(timeout>0); timeout--){}
+        if (timeout==0) return(RETURN_FAILED);
+        if (ACK==1) TWI0.MCTRLB &= ~(1<<TWI_ACKACT_bp);
+        else        TWI0.MCTRLB |=  (1<<TWI_ACKACT_bp);
+        for (timeout=I2C_WAIT_TIMEOUT; I2C_STATE_IS_LOW(TWI_RIF_bm)&&(timeout>0); timeout--){}
+        if (timeout==0) return(RETURN_FAILED);
+        memdata = TWI0.MDATA;
+        if (I2C_BUSERR) return(RETURN_FAILED);
+        if (I2C_STATE_IS_LOW(TWI_RXACK_bm)) return(RETURN_OK);
+        else return(RETURN_FAILED);
+    }
+    return(RETURN_FAILED);
+}
+void I2C_StartMaster(void) {
+    PORTB.DIRSET = I2C_SCL; PORTB.DIRSET = I2C_SDA;
+    TWI0.CTRLA   = TWI_SDAHOLD_500NS_gc | TWI_SDASETUP_8CYC_gc;
+    TWI0.MBAUD   = (uint8_t)TWI0_BAUD(100000, 1000);
+    TWI0.MCTRLA  = 1<<TWI_ENABLE_bp | 0<<TWI_QCEN_bp | 0<<TWI_RIEN_bp
+                 | 1<<TWI_SMEN_bp | TWI_TIMEOUT_DISABLED_gc | 0<<TWI_WIEN_bp;
+    TWI0.MSTATUS = TWI_BUSSTATE_IDLE_gc;
+    TWI0.MSTATUS = (TWI_RIF_bm | TWI_WIF_bm);
+    TWI0.MCTRLB  = TWI_FLUSH_bm;
+}
+void InitI2C(void) { I2C_StartMaster(); }
+bool start_transmission(char device_address) { return(I2C_RawStart(device_address, I2C_WRITE)); }
+bool stop_transmission(void)                 { return(I2C_RawStop()); }
+void write_on_bus(unsigned char ch)          { I2C_RawWrite(ch); }
+void ADS122C04_sendCommand(uint8_t command) {
+    start_transmission(ADS122C04_ADDR); write_on_bus(command); stop_transmission();
+}
+void start(void)         { ADS122C04_sendCommand(ADS122C04_START_CMD);     }
+void reset(void)         { ADS122C04_sendCommand(ADS122C04_RESET_CMD);     }
+void ADC_powerdown(void) { ADS122C04_sendCommand(ADS122C04_POWERDOWN_CMD); }
+void ADS122C04_sendCommandWithValue(uint8_t command, uint8_t value) {
+    start_transmission(ADS122C04_ADDR); write_on_bus(command);
+    write_on_bus(value); stop_transmission();
+}
+void ADS122C04_writeReg(uint8_t reg, uint8_t writeValue) {
+    ADS122C04_sendCommandWithValue(ADS122C04_WRITE_CMD(reg), writeValue);
+}
+bool ADS122C04_readReg(uint8_t reg, uint8_t *readValue) {
+    uint8_t command = ADS122C04_READ_CMD(reg);
+    start_transmission(ADS122C04_ADDR); write_on_bus(command); stop_transmission();
+    if (I2C_RawStart(ADS122C04_ADDR, I2C_READ)) { I2C_RawStop(); }
+    if (I2C_RawRead(1)) { I2C_RawStop(); return(false); }
+    else { *readValue=memdata; I2C_RawStop(); return(true); }
+}
+bool ADS122C04_getConversionData(uint32_t *conversionData) {
+    uint8_t RXByte[3]={0};
+    start_transmission(ADS122C04_ADDR); write_on_bus(ADS122C04_RDATA_CMD); stop_transmission();
+    if (I2C_RawStart(ADS122C04_ADDR, I2C_READ)) { I2C_RawStop(); }
+    if (I2C_RawRead(1)) { I2C_RawStop(); } RXByte[0]=memdata;
+    if (I2C_RawRead(1)) { I2C_RawStop(); } RXByte[1]=memdata;
+    if (I2C_RawRead(1)) { I2C_RawStop(); } RXByte[2]=memdata;
+    *conversionData=((uint32_t)RXByte[2])|((uint32_t)RXByte[1]<<8)|((uint32_t)RXByte[0]<<16);
+    return(true);
+}
+uint32_t readADC(void) { uint32_t r; ADS122C04_getConversionData(&r); return r; }
+bool checkDataReady(void) {
+    ADS122C04_readReg(ADS122C04_CONFIG_2_REG, &ADS122C04_Reg.reg2.all);
+    return(ADS122C04_Reg.reg2.bit.DRDY > 0);
+}
+void setInputMultiplexer(uint8_t m) { ADS122C04_Reg.reg0.bit.MUX=m;       ADS122C04_writeReg(0,ADS122C04_Reg.reg0.all); }
+void setGain(uint8_t g)             { ADS122C04_Reg.reg0.bit.GAIN=g;      ADS122C04_writeReg(0,ADS122C04_Reg.reg0.all); }
+void enablePGA(uint8_t e)           { ADS122C04_Reg.reg0.bit.PGA_BYPASS=e;ADS122C04_writeReg(0,ADS122C04_Reg.reg0.all); }
+void setDataRate(uint8_t r)         { ADS122C04_Reg.reg1.bit.DR=r;        ADS122C04_writeReg(1,ADS122C04_Reg.reg1.all); }
+void setOperatingMode(uint8_t m)    { ADS122C04_Reg.reg1.bit.MODE=m;      ADS122C04_writeReg(1,ADS122C04_Reg.reg1.all); }
+void setConversionMode(uint8_t m)   { ADS122C04_Reg.reg1.bit.CMBIT=m; ADS122C04_writeReg(1,ADS122C04_Reg.reg1.all); }
+void setVoltageReference(uint8_t r) { ADS122C04_Reg.reg1.bit.VVREF=r;     ADS122C04_writeReg(1,ADS122C04_Reg.reg1.all); }
+void enableInternalTempSensor(uint8_t e){ ADS122C04_Reg.reg1.bit.TS=e;    ADS122C04_writeReg(1,ADS122C04_Reg.reg1.all); }
+void setDataCounter(uint8_t e)      { ADS122C04_Reg.reg2.bit.DCNT=e;      ADS122C04_writeReg(2,ADS122C04_Reg.reg2.all); }
+void setDataIntegrityCheck(uint8_t s){ ADS122C04_Reg.reg2.bit.CRCbits=s;  ADS122C04_writeReg(2,ADS122C04_Reg.reg2.all); }
+void setBurnOutCurrent(uint8_t e)   { ADS122C04_Reg.reg2.bit.BCS=e;       ADS122C04_writeReg(2,ADS122C04_Reg.reg2.all); }
+void setIDACcurrent(uint8_t c)      { ADS122C04_Reg.reg2.bit.IDAC=c;      ADS122C04_writeReg(2,ADS122C04_Reg.reg2.all); }
+void setIDAC1mux(uint8_t s)         { ADS122C04_Reg.reg3.bit.I1MUX=s;     ADS122C04_writeReg(3,ADS122C04_Reg.reg3.all); }
+void setIDAC2mux(uint8_t s)         { ADS122C04_Reg.reg3.bit.I2MUX=s;     ADS122C04_writeReg(3,ADS122C04_Reg.reg3.all); }
+
+/* ================================================================== */
+/*  TIMER / MILLIS                                                     */
+/* ================================================================== */
+void timer_init(void) {
+    TCA0.SINGLE.CTRLA   = TCA_SINGLE_CLKSEL_DIV64_gc;
+    TCA0.SINGLE.PER     = 52;
+    TCA0.SINGLE.INTCTRL = TCA_SINGLE_OVF_bm;
+    TCA0.SINGLE.CTRLA  |= TCA_SINGLE_ENABLE_bm;
+}
+ISR(TCA0_OVF_vect) { millis_count++; TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm; }
+
+/* ================================================================== */
+/*  EEPROM HELPERS                                                     */
+/* ================================================================== */
+void mem_write(unsigned int addr, long int val) {
+    unsigned int r=(unsigned int)(val/10000), s=(unsigned int)(val%10000);
+    eeprom_write_byte((uint8_t*)(1*addr),(uint8_t)r);         while(!eeprom_is_ready());
+    addr++; eeprom_write_byte((uint8_t*)(1*addr),(uint8_t)(s/256)); while(!eeprom_is_ready());
+    addr++; eeprom_write_byte((uint8_t*)(1*addr),(uint8_t)(s%256)); while(!eeprom_is_ready());
+}
+long int mem_read(uint8_t addr) {
+    long int l=eeprom_read_byte((uint8_t*)(1*addr)); asm("nop"); addr++;
+    unsigned int m=eeprom_read_byte((uint8_t*)(1*addr)); asm("nop"); addr++;
+    unsigned int n=eeprom_read_byte((uint8_t*)(1*addr));
+    _delay_ms(30);
+    return (l*10000+m*256+n);
+}
+
+/* ================================================================== */
+/*  UART                                                               */
+/* ================================================================== */
+void USART1_sendChar(char c) {
+    while (!(USART1.STATUS & USART_DREIF_bm)) {} USART1.TXDATAL = c;
+}
+void USART1_sendStr(const char *s) { while (*s) USART1_sendChar(*s++); }
+void tx_newline(void) { USART1_sendChar(0x0D); USART1_sendChar(0x0A); }
+void USART1_sendUInt(uint32_t v) {
+    char buf[11]; uint8_t i=0;
+    if (v==0) { USART1_sendChar('0'); return; }
+    while (v>0) { buf[i++]='0'+(v%10); v/=10; }
+    while (i--) USART1_sendChar(buf[i]);
+}
+void USART1_sendLong(long v) {
+    if (v<0) { USART1_sendChar('-'); v=-v; }
+    USART1_sendUInt((uint32_t)v);
+}
+void USART1_sendFloat(float v, uint8_t decimals) {
+    if (v < 0.0f) { USART1_sendChar('-'); v = -v; }
+    float mult = 1.0f;
+    for (uint8_t i = 0; i < decimals; i++) mult *= 10.0f;
+    long full = (long)(v * mult + 0.5f);
+    long iv   = full / (long)mult;
+    long frac = full % (long)mult;
+    USART1_sendUInt((uint32_t)iv); USART1_sendChar('.');
+    long fmult = (long)mult / 10;
+    while (fmult > 1 && frac < fmult) { USART1_sendChar('0'); fmult /= 10; }
+    if (frac > 0) USART1_sendUInt((uint32_t)frac); else USART1_sendChar('0');
+}
+/* ================================================================== */
+/*  CHANGE 15 ? DELTA-EMF 1-decimal CLIPPED (truncated) helpers        */
+/*                                                                     */
+/*  Both deliberately TRUNCATE toward zero instead of rounding:        */
+/*  309.699 -> 309.6 (never 309.7). USART1_sendFloat() adds 0.5 and    */
+/*  therefore rounds, so it must not be used for these two fields.     */
+/* ================================================================== */
+
+/* Frame encoding: mV x10 as int16, truncated then CLAMPED so a freak
+ * value can never wrap the 2-byte field. +-3276.7 mV of headroom vs the
+ * ~820 mV these signals can actually reach. */
+static int16_t emf_x10_clip(float v) {
+    long t = (long)(v * 10.0f);          /* cast truncates toward zero */
+    if (t >  32767L) t =  32767L;
+    if (t < -32768L) t = -32768L;
+    return (int16_t)t;
+}
+
+/* ASCII: print exactly one decimal place, clipped (not rounded). */
+static void tx_1dp_trunc(float v) {
+    if (v < 0.0f) { USART1_sendChar('-'); v = -v; }
+    long t = (long)(v * 10.0f);          /* cast truncates toward zero */
+    USART1_sendUInt((uint32_t)(t / 10L));
+    USART1_sendChar('.');
+    USART1_sendUInt((uint32_t)(t % 10L));
+}
+
+static void tx_flush(void) {
+    /* Wait for TX shift register to drain after a transmission.
+     * Only call this when you know at least one byte was sent. */
+    while (!(USART1.STATUS & USART_TXCIF_bm)) {}
+    USART1.STATUS = USART_TXCIF_bm;
+}
+
+/* rx_enable_no_flush() removed (CHANGE 8): every command now transmits
+ * at least the 0x0A "OK" 0x0D ack in frame mode, so TXCIF is always set
+ * after process_cmd() and the full rx_enable()/tx_flush() is always
+ * safe (and required, to drain the RS-485 loopback of the ack bytes). */
+
+/*
+ * RS-485 loopback guard.
+ * With RS485 mode enabled, every TX byte loops back into RX and fires the
+ * RXC ISR. Binary frame bytes can contain 0x2A ('*') and 0x23 ('#'),
+ * causing the ISR to falsely parse a command, corrupt company[], set
+ * cmd_ready, and trigger process_cmd() with garbage ? which resets engine
+ * state mid-run. Fix: disable RX interrupt for the duration of each TX
+ * burst, then drain the loopback byte and re-enable.
+ */
+static inline void rx_disable(void) {
+    USART1.CTRLA &= ~USART_RXCIE_bm;
+}
+static inline void rx_enable(void) {
+    tx_flush();                          /* wait until last bit has left */
+    (void)USART1.RXDATAL;               /* drain any loopback byte in RX buf */
+    USART1.STATUS = USART_RXCIF_bm;    /* clear RX complete flag            */
+    USART1.CTRLA |= USART_RXCIE_bm;    /* re-enable RX interrupt            */
+}
+
+/*
+ * tx_ack() ? send an ASCII acknowledgement string only in continuous mode.
+ * In frame mode, ACK strings corrupt the binary frame stream on the host,
+ * so they are silently suppressed. do_stop() uses this for OK_STOPPED too;
+ * the binary stopped-frame is the implicit ack in frame mode.
+ */
+static inline void tx_ack(const char *s) {
+    /* CHANGE 11: any handler that reports failure calls tx_ack("ERR...").
+     * Detect that here (works in every mode) so the frame-mode wrapper can
+     * send "ERR" instead of "OK". The ASCII text itself is still only
+     * emitted in continuous/idle mode, exactly as before. */
+    if (s[0] == 'E' && s[1] == 'R' && s[2] == 'R') cmd_failed = true;
+    if (run_mode_state != MODE_FRAME) USART1_sendStr(s);
+}
+
+/*
+ * tx_frame_ok() ? uniform frame-mode command acknowledgement.
+ * 0x0A + "OK" + 0x0D: the exact same envelope style as the MNST boot
+ * message, so the host frame parser can recognise it as a short
+ * delimited message between binary frames. Emitted exactly ONCE per
+ * processed command while in frame mode (see the process_cmd() wrapper
+ * below the dispatcher). It is only ever called from inside the
+ * rx_disable() held by run_mode()'s command block, and always lands
+ * BETWEEN two complete frames (commands are only serviced between
+ * samples) ? it can never split or corrupt a frame.
+ */
+static inline void tx_frame_ok(void) {
+    USART1_sendChar(0x0A);
+    USART1_sendChar('O');
+    USART1_sendChar('K');
+    USART1_sendChar(0x0D);
+}
+
+/* CHANGE 11: frame-mode negative ack ? same 0x0A...0x0D envelope as the
+ * OK ack, payload "ERR". Sent by the process_cmd() wrapper when the
+ * dispatcher reported a failure (cmd_failed) for the command just run. */
+static inline void tx_frame_err(void) {
+    USART1_sendChar(0x0A);
+    USART1_sendChar('E');
+    USART1_sendChar('R');
+    USART1_sendChar('R');
+    USART1_sendChar(0x0D);
+}
+
+/* CHANGE 10: set by a command handler to suppress the automatic frame-mode
+ * "OK" ack for that ONE command; cleared by the process_cmd() wrapper on
+ * every command. Currently used only by *GET PARAMS#, whose 0x23...0x0D
+ * blob is its own complete reply. */
+static bool suppress_frame_ok = false;
+
+/* ================================================================== */
+/*  SENSOR READ                                                        */
+/* ================================================================== */
+void set_sample_timing(uint8_t dr) {
+    switch(dr) {
+        case ADS122C04_DATA_RATE_20SPS:   inter_sample_ms=50;  drdy_timeout_ms=75;  break;
+        case ADS122C04_DATA_RATE_45SPS:   inter_sample_ms=22;  drdy_timeout_ms=75;  break;
+        case ADS122C04_DATA_RATE_90SPS:   inter_sample_ms=44;  drdy_timeout_ms=44;  break;
+        case ADS122C04_DATA_RATE_175SPS:  inter_sample_ms=30;  drdy_timeout_ms=36;  break;
+        case ADS122C04_DATA_RATE_330SPS:  inter_sample_ms=12;  drdy_timeout_ms=18;  break;
+        case ADS122C04_DATA_RATE_600SPS:  inter_sample_ms=8;   drdy_timeout_ms=12;  break;
+        case ADS122C04_DATA_RATE_1000SPS: inter_sample_ms=4;   drdy_timeout_ms=8;   break;
+        default:                          inter_sample_ms=50;  drdy_timeout_ms=75;  break;
+    }
+}
+static void filter_raw_sensor(void) {
+    if (raw_sensor_uv >= pub_adc_value) {
+        diff_adc_value = raw_sensor_uv - pub_adc_value;
+        if (diff_adc_value > (long long)limit) pub_adc_value = raw_sensor_uv;
+        else                                   raw_sensor_uv = pub_adc_value;
+    } else {
+        diff_adc_value = pub_adc_value - raw_sensor_uv;
+        if (diff_adc_value > (long long)limit) pub_adc_value = raw_sensor_uv;
+        else                                   raw_sensor_uv = pub_adc_value;
+    }
+}
+static void read_sensor_slow(void) {
+    long long adc_avg = 0;
+    for (unsigned int i = 0; i < 4; i++) {
+        bool drdy=0; uint16_t mc=0; start();
+        do { mc++; _delay_ms(1); drdy=checkDataReady(); } while (!drdy && mc<drdy_timeout_ms);
+       // uint32_t raw=readADC(); long long signed_raw = (raw >= 0x800000) ? (long long)raw - 0x1000000LL : (long long)raw;
+	   uint32_t raw=readADC();
+	   long long signed_raw = (raw >= 0x800000) ? (long long)raw - 0x1000000LL : (long long)raw;
+        adc_avg += (long long)(((float)signed_raw)/4096.0f*1000.0f);
+        for (uint16_t d=0; d<inter_sample_ms; d++) _delay_ms(1);
+    }
+    raw_sensor_uv = adc_avg / 4;
+    if (raw_sensor_uv > 2047999) raw_sensor_uv = 2047999;
+    filter_raw_sensor();
+    sensor_final_output = raw_sensor_uv;
+}
+static void read_sensor_single(void) {
+    bool drdy=0; uint32_t t=millis_count; start();
+    do { drdy=checkDataReady(); } while (!drdy && (millis_count-t)<drdy_timeout_ms);
+    //uint32_t raw=readADC(); long long signed_raw = (raw >= 0x800000) ? (long long)raw - 0x1000000LL : (long long)raw;
+	uint32_t raw=readADC();
+	long long signed_raw = (raw >= 0x800000) ? (long long)raw - 0x1000000LL : (long long)raw;
+    raw_sensor_uv = (long long)(((float)signed_raw)/4096.0f*1000.0f);
+    if (raw_sensor_uv > 2047999) raw_sensor_uv = 2047999;
+    t=millis_count; while ((millis_count-t)<inter_sample_ms) {}
+    filter_raw_sensor();
+    sensor_final_output = raw_sensor_uv;
+}
+void read_sensor(void) {
+    switch (diag_dr) {
+        case ADS122C04_DATA_RATE_20SPS:
+        case ADS122C04_DATA_RATE_45SPS: read_sensor_slow();   break;
+        default:                        read_sensor_single(); break;
+    }
+}
+
+/* ================================================================== */
+/*  COMMAND PARSER                                                     */
+/* ================================================================== */
+static long parse_long(char **str) {
+    char *p=*str; while (*p==' '||*p=='\t') p++;
+    long sign=1;
+    if (*p=='-'){sign=-1;p++;} else if (*p=='+') p++;
+    long val=0;
+    while (*p>='0'&&*p<='9') val=val*10+(*p++-'0');
+    *str=p; return sign*val;
+}
+static float parse_float(char **str) {
+    char *p=*str; while (*p==' '||*p=='\t') p++;
+    float sign=1.0f;
+    if (*p=='-'){sign=-1.0f;p++;} else if (*p=='+') p++;
+    long int_part=0;
+    while (*p>='0'&&*p<='9') int_part=int_part*10+(*p++-'0');
+    float val=(float)int_part;
+    if (*p=='.') {
+        p++; float frac=0.0f, scale=0.1f;
+        while (*p>='0'&&*p<='9') { frac+=(*p++-'0')*scale; scale*=0.1f; }
+        val+=frac;
+    }
+    *str=p; return sign*val;
+}
+
+/* CHANGE 14: true only if the text at p is a COMPLETE number.
+ * parse_float()/parse_long() silently yield 0 for junk like "BIHAR", so
+ * callers must screen the argument first or they will store 0 and report
+ * success. Accepts  [+|-] digits [ . digits ]  terminated by space, tab,
+ * '#' or NUL. Rejects "", "BIHAR", "6ABC", "-", ".". */
+static bool is_num(const char *p) {
+    while (*p==' '||*p=='\t') p++;
+    if (*p=='+'||*p=='-') p++;
+    bool dig = false;
+    while (*p>='0'&&*p<='9') { p++; dig = true; }
+    if (*p=='.') { p++; while (*p>='0'&&*p<='9') { p++; dig = true; } }
+    if (!dig) return false;
+    return (*p=='#'||*p==' '||*p=='\t'||*p=='\0');
+}
+
+/*
+ * send_params() line framing (CHANGE 9):
+ *   continuous / idle : each line ends with "\r\n" -- byte-for-byte
+ *                       identical to the previous output format.
+ *   frame mode        : each line is wrapped in the MNST-style envelope
+ *                       0x0A <ASCII line> 0x0D (no "\r\n"), so the host
+ *                       frame parser receives ~40 short delimited ASCII
+ *                       messages between two binary frames -- the same
+ *                       pattern it already accepts for "MNST" and "OK".
+ * sp_bol()/sp_eol() pick the framing at runtime from run_mode_state.
+ */
+/* CHANGE 10: in frame mode the whole *GET PARAMS# dump is now ONE
+ * single blob:
+ *     0x23 <entire dump, lines separated by 0x0A '\n'> 0x0D
+ * The host rule is simply: on seeing 0x23, collect and print everything
+ * up to the next 0x0D. Nothing else in the protocol starts with 0x23,
+ * so the blob is unambiguous. No per-line 0x0A/0x0D envelopes anymore,
+ * and (see process_cmd wrapper) NO trailing "OK" ack for this one
+ * command -- the 0x0D closing the blob is the end of the reply.
+ * Continuous/idle output is unchanged: "\r\n" per line as always. */
+static inline void sp_bol(void) {
+    /* no per-line start byte anymore (blob is opened once in send_params) */
+}
+static inline void sp_eol(void) {
+    if (run_mode_state == MODE_FRAME) USART1_sendChar(0x0A);   /* internal newline inside the blob */
+    else                              USART1_sendStr("\r\n");
+}
+
+static void send_params(void) {
+    /* CHANGE 9: no longer suppressed in frame mode -- every line goes out
+     * in an MNST-style envelope (see sp_bol/sp_eol above). Commands are
+     * only serviced between samples, so the whole dump lands BETWEEN two
+     * complete binary frames; frame output pauses for the dump and
+     * resumes on the next sample. */
+/* Helper: flush TX, drain RS-485 loopback, re-disable RX for next line.
+ * send_params() is called from inside process_cmd() which holds rx_disable().
+ * At 9600 baud ~500 bytes takes ~500ms ? we must drain the loopback echo
+ * after each line or the RX buffer stalls and the UART appears to freeze. */
+#define PLE()  do { rx_enable(); rx_disable(); } while(0)
+    if (run_mode_state == MODE_FRAME) USART1_sendChar(0x23);   /* CHANGE 10: open the params blob */
+    sp_bol(); USART1_sendStr("PARAMS:"); sp_eol();                                  PLE();
+    sp_bol(); USART1_sendStr(" JMP="); USART1_sendFloat(P.jmp,5);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" ALP="); USART1_sendFloat(P.alp,5);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" UPG="); USART1_sendFloat(P.upG,2);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" ING="); USART1_sendFloat(P.inG,4);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" DNG="); USART1_sendFloat(P.dnG,2);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" DNI="); USART1_sendFloat(P.dnI,4);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" REC="); USART1_sendFloat(P.rec,4);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" DRF="); USART1_sendFloat(P.drf,2);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" NTH="); USART1_sendFloat(P.n_thresh,6);             sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" NTL="); USART1_sendFloat(P.n_thresh_low,6);        sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" NPT="); USART1_sendFloat(P.n_thresh_ppm_thresh,1); sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" OCP="); USART1_sendUInt(P.o_cap);                   sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" RZP="); USART1_sendFloat(P.rec_zero_pct,4);         sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" WRM="); USART1_sendUInt(P.warmup);                  sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" ORT="); USART1_sendFloat(P.or_thresh,2);            sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" ORX="); USART1_sendFloat(P.or_exit_mv,2);           sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" ORS="); USART1_sendFloat(P.or_sd_stable,8);         sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" DMP="); USART1_sendFloat(P.daughter_mother_prox,3); sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" PHT="); USART1_sendFloat(P.post_high_conc_thresh,1);    sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" PHL="); USART1_sendUInt(P.post_high_counter_limit);     sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" PHU="); USART1_sendFloat(P.post_high_upG,2);            sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" PHI="); USART1_sendFloat(P.post_high_inG,4);            sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" SFS="); USART1_sendFloat(P.sf_step,5);                 sp_eol(); PLE();
+    sp_bol(); USART1_sendStr(" ART="); USART1_sendFloat(P.an_reset_thresh_mv,1);      sp_eol(); PLE();
+    sp_bol(); USART1_sendStr("FAST_CALIB:"); sp_eol(); PLE();
+    for (uint8_t i=0; i<CALIB_N; i++) {
+        sp_bol();
+        USART1_sendStr(" ["); USART1_sendUInt(i); USART1_sendStr("] ");
+        USART1_sendFloat(CALIB_FAST[i].p_mv,4);
+        USART1_sendStr("mV -> "); USART1_sendLong(CALIB_FAST[i].ppm);
+        USART1_sendStr("ppm band="); USART1_sendFloat(CALIB_FAST[i].band_mv,3);
+        USART1_sendStr("mV sf="); USART1_sendFloat(CALIB_FAST[i].sf,2);
+        USART1_sendStr(" eff="); USART1_sendFloat(calib_eff_mv(&CALIB_FAST[i]),4);
+        USART1_sendStr("mV");
+        sp_eol(); PLE();
+    }
+    sp_bol(); USART1_sendStr("AN_CALIB:"); sp_eol(); PLE();
+    for (uint8_t i=0; i<CALIB_N; i++) {
+        sp_bol();
+        USART1_sendStr(" ["); USART1_sendUInt(i); USART1_sendStr("] ");
+        USART1_sendFloat(CALIB_AN[i].p_mv,4);
+        USART1_sendStr("mV -> "); USART1_sendLong(CALIB_AN[i].ppm);
+        USART1_sendStr("ppm band="); USART1_sendFloat(CALIB_AN[i].band_mv,3);
+        USART1_sendStr("mV sf="); USART1_sendFloat(CALIB_AN[i].sf,2);
+        USART1_sendStr(" eff="); USART1_sendFloat(calib_eff_mv(&CALIB_AN[i]),4);
+        USART1_sendStr("mV");
+        sp_eol(); PLE();
+    }
+    sp_bol();
+    if (mother_baseline_valid) {
+        USART1_sendStr("STORED_MB="); USART1_sendFloat(stored_mother_baseline,3);
+        USART1_sendStr("mV");
+    } else { USART1_sendStr("STORED_MB=none"); }
+    sp_eol();
+    PLE();
+    sp_bol(); USART1_sendStr("REF="); USART1_sendLong((long)Reference_Set_Value); sp_eol(); PLE();
+    sp_bol(); USART1_sendStr("LIMIT="); USART1_sendUInt((uint32_t)limit); sp_eol(); PLE();
+    sp_bol(); USART1_sendStr("OFFSET="); USART1_sendUInt((uint32_t)offset_value); sp_eol(); PLE();
+    sp_bol(); USART1_sendStr("END"); sp_eol();
+    if (run_mode_state == MODE_FRAME) USART1_sendChar(0x0D);   /* CHANGE 10: close the params blob */
+    /* Final flush + loopback drain done by rx_enable() in run_mode() after process_cmd() returns.
+     * In frame mode the wrapper's 0x0A "OK" 0x0D ack follows the END line. */
+#undef PLE
+}
+
+/* Forward declarations ? defined after frame_crc16 below */
+static void tx_stopped_continuous(void);
+static void tx_stopped_frame(void);
+
+/*
+ * do_stop() ? one-shot check for safe power-off.
+ *
+ * Conditions for a clean stop:
+ *   - Engine is running (warmup complete)
+ *   - OR state is normal (not in overrange)
+ *   - II == -1 (not detecting UP)
+ *   - rec_pct == 100 (fully recovered / baseline)
+ *
+ * Met  ? save mother_baseline to EEPROM (same MB_EE_DATA_ADDR location),
+ *         emit one stopped output (all cols 0, Col 10 = 9),
+ *         print OK_STOPPED, go idle.
+ * Not met ? print BRING PROBE TO AIR / WAIT once, return,
+ *            normal data output resumes on next sample.
+ */
+static void do_stop(void) {
+    /* NOTE: called from process_cmd() which is already inside rx_disable().
+     * Do NOT call rx_disable()/rx_enable() here ? the caller owns them.
+     * Just send directly; the caller's rx_enable() will drain the loopback. */
+
+    bool safe = (warmup_phase == WARMUP_RUNNING)
+             && (or_state    == OR_NORMAL)
+             && (II          == -1.0f)
+             && (rec_pct     >= 100.0f);
+
+    if (!safe) {
+        /* Conditions not met ? print warning once, then return so normal
+         * data output resumes immediately on the next loop iteration.
+         * Do NOT set MODE_IDLE here. */
+        if (run_mode_state != MODE_FRAME) USART1_sendStr("BRING PROBE TO AIR / WAIT\r\n");
+        return;
+    }
+
+    /* Conditions met ? save baseline to EEPROM */
+    mb_ee_save(mother_baseline);
+    stored_mother_baseline = mother_baseline;
+    mother_baseline_valid  = true;
+
+    /* Emit one stopped output: all cols 0, Col 10 = 9 */
+    if (run_mode_state == MODE_CONTINUOUS) {
+        USART1_sendChar(0x0A);
+        tx_stopped_continuous();
+    } else {
+        tx_stopped_frame();   /* binary frame IS the ack in frame mode */
+    }
+    if (run_mode_state != MODE_FRAME) USART1_sendStr("OK_STOPPED\r\n");
+
+    run_mode_state = MODE_IDLE;
+    /* run_mode() loop will now fall into the MODE_IDLE branch
+       and wait silently for *start# or *frame# again. */
+}
+
+static void process_cmd_dispatch(void) {
+    /* Normalize to uppercase ? all commands work regardless of case.
+     * Essential in frame mode where the user has no ACK feedback. */
+    for (uint8_t i = 1; i < rxcntr; i++) {
+        if (company[i] >= 'a' && company[i] <= 'z')
+            company[i] = (unsigned char)(company[i] - 32u);
+    }
+    const char *s = (const char*)&company[1];
+
+    /* *START# ? enter continuous ASCII output mode */
+    if (s[0]=='S'&&s[1]=='T'&&s[2]=='A'&&s[3]=='R'&&s[4]=='T'&&s[5]=='#') {
+        /* If switching from frame mode, emit one all-zero continuous line
+         * (ST=9) so the host sees a clean mode-switch sentinel before the
+         * first real data line. Mirrors what *stop# does on the way out. */
+        if (run_mode_state == MODE_FRAME) {
+            rx_disable();
+            USART1_sendChar(0x0A);
+            tx_stopped_continuous();
+            rx_enable();
+        }
+        run_mode_state = MODE_CONTINUOUS;
+        frame_cn       = 0;
+        tx_ack("OK_START\r\n");
+        tx_ack("COLS: RefR EMF_mV DispPPM Type H2_Flag Rec_Status OR_Status Warmup PostCnt ProbeState NthMode DeltaF_mV DeltaA_mV\r\n");
+        return;
+    }
+
+    /* *FRAME# ? enter binary frame mode (data frame by default) */
+    if (s[0]=='F'&&s[1]=='R'&&s[2]=='A'&&s[3]=='M'&&s[4]=='E'&&s[5]=='#') {
+        /* NOTE: tx_ack() must be called BEFORE run_mode_state changes to
+         * MODE_FRAME. tx_ack() only sends when run_mode_state != MODE_FRAME,
+         * so if we flip the state first, the guard sees MODE_FRAME already
+         * and the ack is silently dropped ? no TXCIF ever gets set, and the
+         * full rx_enable()/tx_flush() call back in run_mode() spins forever
+         * (only a power cycle recovers). Sending the ack first guarantees a
+         * real byte goes out whenever we're transitioning in from IDLE or
+         * CONTINUOUS, so tx_flush() has something to wait for. */
+        tx_ack("OK_FRAME_DATA\r\n");
+        run_mode_state = MODE_FRAME;
+        frame_type     = FRAME_DATA;
+        frame_cn       = 0;
+        return;
+    }
+
+    /* *DIG# ? switch to diagnostic frame (only effective in frame mode) */
+    if (s[0]=='D'&&s[1]=='I'&&s[2]=='G'&&s[3]=='#') {
+        frame_type = FRAME_DIAG;
+        tx_ack("OK_FRAME_DIAG\r\n");
+        return;
+    }
+
+    /* *DATA# ? switch back to data frame (only effective in frame mode) */
+    if (s[0]=='D'&&s[1]=='A'&&s[2]=='T'&&s[3]=='A'&&s[4]=='#') {
+        frame_type = FRAME_DATA;
+        tx_ack("OK_FRAME_DATA\r\n");
+        return;
+    }
+
+    /* *STOP# ? one-shot safe-stop check */
+    if (s[0]=='S'&&s[1]=='T'&&s[2]=='O'&&s[3]=='P'&&s[4]=='#') {
+        do_stop();
+        return;
+    }
+
+    /* *TEAR# / *TARE# ? force exit from warmup / reset (both spellings accepted) */
+    if ((s[0]=='T'&&s[1]=='E'&&s[2]=='A'&&s[3]=='R'&&s[4]=='#') ||
+        (s[0]=='T'&&s[1]=='A'&&s[2]=='R'&&s[3]=='E'&&s[4]=='#')) { do_tear(); return; }
+
+    /* *SET UPG <value># / *SET ING <value># ? allowed in frame mode too.
+     * Handled here (above the frame-mode gate) so these two specific keys
+     * are not silently discarded while streaming binary frames. Parsing
+     * and assignment are IDENTICAL to the generic *SET <KEY> handler
+     * further below (same key layout, same params_ee_save(), same ACK
+     * format) -- this block only lets UPG/ING through earlier so they
+     * also work in frame mode; behaviour in continuous mode is unchanged.
+     * ACK text uses the same run_mode_state guard every other frame-safe
+     * command in this file already uses to avoid corrupting the binary
+     * frame stream. */
+    if (s[0]=='S'&&s[1]=='E'&&s[2]=='T'&&s[3]==' '&&
+        ((s[4]=='U'&&s[5]=='P'&&s[6]=='G') || (s[4]=='I'&&s[5]=='N'&&s[6]=='G')) &&
+        s[7]==' ') {
+        char key[4]={s[4],s[5],s[6],0};
+        /* CHANGE 14: reject a non-numeric value BEFORE writing anything ?
+         * previously "*SET UPG BIHAR#" stored 0.0 and answered OK. */
+        if (!is_num(&s[8])) { tx_ack("ERR_VALUE\r\n"); return; }
+        char *ptr=(char*)&s[8];
+        float fval=parse_float(&ptr);
+
+        if (strcmp(key,"UPG")==0) P.upG = fval;
+        else                      P.inG = fval;
+
+        params_ee_save();
+        if (run_mode_state != MODE_FRAME) {
+            USART1_sendStr("OK SET "); USART1_sendStr(key);
+            USART1_sendChar('='); USART1_sendFloat(fval,6); tx_newline();
+        }
+        return;
+    }
+
+    /* *1CAL <ppm># -- one-shot calibration using current DELTA-EMF snapshot.
+     * Moved above the frame-mode gate: do_oneshot_calib() already guards
+     * all of its ASCII output with run_mode_state != MODE_FRAME internally
+     * (tx_ack() + its own explicit guard), so it was already frame-safe --
+     * it just needed to be reachable before the gate discarded it. */
+    if (s[0]=='1'&&s[1]=='C'&&s[2]=='A'&&s[3]=='L'&&s[4]==' ') {
+        char *ptr = (char*)&s[5];
+        long ppm_val = parse_long(&ptr);
+        do_oneshot_calib(ppm_val);
+        return;
+    }
+
+    /* *10CAL# -- one-shot 10 ppm calibration. Same reasoning as *1CAL above:
+     * do_10ppm_calib() already guards its ASCII report with
+     * run_mode_state != MODE_FRAME, so moving the dispatch above the gate
+     * makes it usable in frame mode without touching its internals. */
+    if (s[0]=='1'&&s[1]=='0'&&s[2]=='C'&&s[3]=='A'&&s[4]=='L'&&s[5]=='#') {
+        do_10ppm_calib();
+        return;
+    }
+
+    /* *RESETCAL# -- reset the *1CAL scaling factor (sf) back to 1.00 on
+     * every row of both calibration tables. p_mv/ppm/band_mv untouched.
+     * do_reset_cal() already reports via tx_ack(), which is frame-safe. */
+    if (s[0]=='R'&&s[1]=='E'&&s[2]=='S'&&s[3]=='E'&&s[4]=='T'&&
+        s[5]=='C'&&s[6]=='A'&&s[7]=='L'&&s[8]=='#') {
+        do_reset_cal();
+        return;
+    }
+
+    /* ----------------------------------------------------------------
+     * FRAME MODE GATE ? REMOVED (CHANGE 8). Every command below is now
+     * accepted in frame mode as well. Each one already routes its verbose
+     * ASCII output through tx_ack() or an explicit
+     * run_mode_state != MODE_FRAME guard, so side effects execute
+     * normally while the binary stream stays clean. The process_cmd()
+     * wrapper then sends the single uniform 0x0A "OK" 0x0D ack.
+     * *GET PARAMS# (CHANGE 9) dumps in frame mode too, one MNST-style
+     * 0x0A...0x0D envelope per line, always between frames.
+     * ---------------------------------------------------------------- */
+    if (s[0]=='I'&&s[1]=='G'&&s[2]=='N'&&s[3]=='O'&&s[4]=='R'&&s[5]=='E'
+        &&s[6]=='_'&&s[7]=='P'&&s[8]=='R'&&s[9]=='O'&&s[10]=='X'&&s[11]=='#') {
+        ignore_prox = true;
+        /*
+         * If currently stuck in WARMUP_CHECKING due to prox fail,
+         * re-evaluate immediately with ignore_prox now true.
+         */
+        if (!baseline_seeded && warmup_phase == WARMUP_CHECKING) {
+            /* Only re-evaluate if the current window is already full;
+             * otherwise the next completed window will catch it automatically. */
+            if (wu_chk_filled == WARMUP_CHECK_SAMPLES) {
+                float mean_now = wu_mean();
+                float sd_now   = wu_chk_sd();
+                if (sd_now < WARMUP_SD_THRESH) {
+                    _full_reset_state(mean_now, POST_HIGH_RESET);
+                } else {
+                    wu_chk_reset(); /* discard stale window, start fresh */
+                }
+            }
+        }
+        tx_ack("OK_IGNORE_PROX\r\n"); return;
+    }
+
+    /* *RF<7-digit># */
+    if (s[0]=='R'&&s[1]=='F'&&rxcntr==12) {
+        long long a=((s[2]-'0')*1000000LL)+((s[3]-'0')*100000LL)
+                   +((s[4]-'0')*10000LL) +((s[5]-'0')*1000LL)
+                   +((s[6]-'0')*100LL)   +((s[7]-'0')*10LL)
+                   +((s[8]-'0')*1LL);
+        Reference_Set_Value=a; P.ref_val=(long)a; scalar_ee_save();
+        tx_ack("OK\r\n"); return;
+    }
+    /* *T<4-digit><2-digit># */
+    if (s[0]=='T'&&rxcntr==10) {
+        long a=(s[1]-'0')*1000L+(s[2]-'0')*100L+(s[3]-'0')*10L+(s[4]-'0');
+        long b=(s[6]-'0')*10L+(s[7]-'0');
+        limit=(unsigned int)a; offset_value=(unsigned char)b;
+        P.limit_val=(uint16_t)a; P.offset_val=(uint8_t)b; scalar_ee_save();
+        tx_ack("OK\r\n"); return;
+    }
+    /* *CAL# */
+    if (s[0]=='C'&&s[1]=='A'&&s[2]=='L'&&s[3]=='#') { do_calibrate(); return; }
+
+    /* *GET PARAMS# ? dump all parameters. CHANGE 9: works in EVERY mode.
+     * In frame mode send_params() wraps each line in the MNST-style
+     * 0x0A...0x0D envelope so the dump cannot corrupt the frame stream;
+     * in continuous/idle mode the output format is unchanged. */
+    if (strncmp(s,"GET PARAMS",10)==0) {
+        send_params();
+        suppress_frame_ok = true;   /* CHANGE 10: blob is the full reply, no OK after it */
+        return;
+    }
+
+    /* *SETCONC <old_ppm> <new_ppm># ? CHANGE 12: re-label a concentration
+     * in the calibration table(s). Finds the row whose ppm == old_ppm and
+     * sets ONLY its ppm to new_ppm (p_mv / band_mv / sf untouched), in both
+     * FAST and AN tables. Persists only the changed row(s). Works in frame
+     * and continuous mode. */
+    if (strncmp(s,"SETCONC ",8)==0) {
+        char *ptr    = (char*)&s[8];
+        /* CHANGE 14: both arguments must be real numbers. Without this,
+         * "*SETCONC A B#" parsed as idx 0 / ppm 0 and rewrote row 0. */
+        if (!is_num(ptr)) { tx_ack("ERR_VALUE\r\n"); return; }
+        long idx     = parse_long(&ptr);
+        if (!is_num(ptr)) { tx_ack("ERR_VALUE\r\n"); return; }
+        long new_ppm = parse_long(&ptr);
+
+        /* Row index must exist. Using the INDEX (not the old ppm) means the
+         * caller never has to know the row's present concentration. */
+        if (idx < 0 || idx >= (long)CALIB_N) {
+            tx_ack("ERR_IDX\r\n");
+            return;
+        }
+
+        /* new_ppm must sit inside this index's allowed band (factory-anchored,
+         * see conc_band). Out of band => reject, write NOTHING. */
+        long lo, hi;
+        if (conc_band((uint8_t)idx, &lo, &hi) && (new_ppm < lo || new_ppm > hi)) {
+            tx_ack("ERR_BAND\r\n");
+            return;
+        }
+
+        long old_ppm = CALIB_FAST[idx].ppm;      /* for the ASCII report only */
+
+        /* Change ONLY the ppm column of this row, in both tables.
+         * p_mv / band_mv / sf are left exactly as they were. */
+        CALIB_FAST[idx].ppm = new_ppm;
+        CALIB_AN[idx].ppm   = new_ppm;
+        calib_save_entry(FAST_EE_MAGIC_ADDR, FAST_EE_DATA_ADDR, CALIB_FAST, (uint8_t)idx);
+        calib_save_entry(AN_EE_MAGIC_ADDR,   AN_EE_DATA_ADDR,   CALIB_AN,   (uint8_t)idx);
+
+        if (run_mode_state != MODE_FRAME) {
+            USART1_sendStr("OK SETCONC ["); USART1_sendUInt((uint32_t)idx);
+            USART1_sendStr("] ");           USART1_sendLong(old_ppm);
+            USART1_sendStr(" -> ");         USART1_sendLong(new_ppm);
+            tx_newline();
+        }
+        return;
+    }
+
+    /* *SET ANCAL <idx> <mV> <ppm> [band_mV]# */
+    if (s[0]=='S'&&s[1]=='E'&&s[2]=='T'&&s[3]==' '&&
+        s[4]=='A'&&s[5]=='N'&&s[6]=='C'&&s[7]=='A'&&s[8]=='L'&&s[9]==' ') {
+        char *ptr=(char*)&s[10];
+        int idx=(int)parse_long(&ptr); float mv=parse_float(&ptr); long ppm=parse_long(&ptr);
+        /* Optional band_mv ? default 0.0 if not supplied */
+        float band_mv = 0.0f;
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+        if (*ptr >= '0' && *ptr <= '9') band_mv = parse_float(&ptr);
+        if (idx>=0&&idx<CALIB_N) {
+            CALIB_AN[idx].p_mv   = mv;
+            CALIB_AN[idx].ppm    = ppm;
+            CALIB_AN[idx].band_mv= band_mv;
+            calib_save_entry(AN_EE_MAGIC_ADDR,AN_EE_DATA_ADDR,CALIB_AN,(uint8_t)idx);
+            tx_ack("OK SET ANCAL\r\n");
+        } else tx_ack("ERR_IDX\r\n");
+        return;
+    }
+    /* *SET CAL <idx> <mV> <ppm> [band_mV]# */
+    if (s[0]=='S'&&s[1]=='E'&&s[2]=='T'&&s[3]==' '&&
+        s[4]=='C'&&s[5]=='A'&&s[6]=='L'&&s[7]==' ') {
+        char *ptr=(char*)&s[8];
+        int idx=(int)parse_long(&ptr); float mv=parse_float(&ptr); long ppm=parse_long(&ptr);
+        /* Optional band_mv ? default 0.0 if not supplied */
+        float band_mv = 0.0f;
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+        if (*ptr >= '0' && *ptr <= '9') band_mv = parse_float(&ptr);
+        if (idx>=0&&idx<CALIB_N) {
+            CALIB_FAST[idx].p_mv   = mv;
+            CALIB_FAST[idx].ppm    = ppm;
+            CALIB_FAST[idx].band_mv= band_mv;
+            calib_save_entry(FAST_EE_MAGIC_ADDR,FAST_EE_DATA_ADDR,CALIB_FAST,(uint8_t)idx);
+            tx_ack("OK SET CAL\r\n");
+        } else tx_ack("ERR_IDX\r\n");
+        return;
+    }
+    /* *SET SFSTEP <value># -- set sf_step for one-shot calibration */
+    if (s[0]=='S'&&s[1]=='E'&&s[2]=='T'&&s[3]==' '&&
+        s[4]=='S'&&s[5]=='F'&&s[6]=='S'&&s[7]=='T'&&s[8]=='E'&&s[9]=='P'&&s[10]==' ') {
+        char *ptr = (char*)&s[11];
+        float v = parse_float(&ptr);
+        if (v > 0.0f && v < 1.0f) {
+            P.sf_step = v;
+            params_ee_save();
+            /* CHANGE 8: guard added ? this report was raw unguarded ASCII
+             * and would corrupt the binary stream now that the command is
+             * reachable in frame mode. */
+            if (run_mode_state != MODE_FRAME) {
+                USART1_sendStr("OK SET SFSTEP="); USART1_sendFloat(v, 5);
+                tx_newline();
+            }
+        } else {
+            tx_ack("ERR_SFSTEP: must be 0 < step < 1 (e.g. 0.05)\r\n");
+        }
+        return;
+    }
+
+    /* *SET <KEY> <value># */
+    if (s[0]=='S'&&s[1]=='E'&&s[2]=='T'&&s[3]==' ') {
+        char key[4]={s[4],s[5],s[6],0};
+        /* CHANGE 14: a valid KEY with a junk VALUE used to store 0 and
+         * answer OK. Screen the value first; unknown keys still fall
+         * through to ERR_UNKNOWN_KEY below. */
+        if (!is_num(&s[8])) { tx_ack("ERR_VALUE\r\n"); return; }
+        char *ptr=(char*)&s[8];
+        float fval=parse_float(&ptr);
+        bool ok=true;
+
+        if      (strcmp(key,"JMP")==0) P.jmp                     = fval;
+        else if (strcmp(key,"ALP")==0) P.alp                     = fval;
+        else if (strcmp(key,"UPG")==0) P.upG                     = fval;
+        else if (strcmp(key,"ING")==0) P.inG                     = fval;
+        else if (strcmp(key,"DNG")==0) P.dnG                     = fval;
+        else if (strcmp(key,"DNI")==0) P.dnI                     = fval;
+        else if (strcmp(key,"REC")==0) P.rec                     = fval;
+        else if (strcmp(key,"DRF")==0) P.drf                     = fval;
+        else if (strcmp(key,"NTH")==0) P.n_thresh                = fval;
+        else if (strcmp(key,"OCP")==0) P.o_cap                   = (uint16_t)fval;
+        else if (strcmp(key,"RZP")==0) P.rec_zero_pct            = fval;
+        else if (strcmp(key,"WRM")==0) P.warmup                  = (uint16_t)fval;
+        else if (strcmp(key,"ORT")==0) P.or_thresh               = fval;
+        else if (strcmp(key,"ORX")==0) P.or_exit_mv              = fval;
+        else if (strcmp(key,"ORS")==0) P.or_sd_stable            = fval;
+        else if (strcmp(key,"DMP")==0) P.daughter_mother_prox    = fval;
+        else if (strcmp(key,"PHT")==0) P.post_high_conc_thresh   = fval;
+        else if (strcmp(key,"PHL")==0) P.post_high_counter_limit = (uint16_t)fval;
+        else if (strcmp(key,"PHU")==0) P.post_high_upG           = fval;
+        else if (strcmp(key,"PHI")==0) P.post_high_inG           = fval;
+        else if (strcmp(key,"NTL")==0) P.n_thresh_low            = fval;
+        else if (strcmp(key,"NPT")==0) P.n_thresh_ppm_thresh     = fval;
+        else if (strcmp(key,"ART")==0) P.an_reset_thresh_mv      = fval;
+        else ok = false;
+
+        if (ok) {
+            params_ee_save();
+            if (run_mode_state != MODE_FRAME) {
+                USART1_sendStr("OK SET "); USART1_sendStr(key);
+                USART1_sendChar('='); USART1_sendFloat(fval,6); tx_newline();
+            }
+        } else { tx_ack("ERR_UNKNOWN_KEY\r\n"); }
+        return;
+    }
+
+    tx_ack("ERR_CMD\r\n");
+}
+
+/*
+ * process_cmd() ? thin wrapper around the dispatcher (CHANGE 8).
+ * After the command executes, if we are (still) in frame mode ? or a
+ * frame-mode *stop# just dropped us to MODE_IDLE ? emit exactly ONE
+ * uniform "OK" ack in the MNST-style envelope (0x0A "OK" 0x0D).
+ * Guarantees:
+ *   - every command received in frame mode is acknowledged, and the ack
+ *     payload is always "OK" ? never a per-command string;
+ *   - the ack fires exactly once per command, no matter which internal
+ *     dispatch path handled it (including ERR paths ? OK here means
+ *     "command received and processed", success/failure is judged from
+ *     the frame data itself, e.g. ProbeState=9 for a clean stop);
+ *   - at least one TX byte always goes out in frame mode, so TXCIF is
+ *     always set and the caller can always use the full
+ *     rx_enable()/tx_flush() ? the old rx_enable_no_flush() hang
+ *     special case is obsolete;
+ *   - the ack lands between frames, never inside one.
+ * Cases:
+ *   frame -> frame       : OK sent (normal frame-mode command)
+ *   idle/cont -> frame   : *FRAME# ? ASCII OK_FRAME_DATA already sent
+ *                          before the mode flip, then OK envelope as the
+ *                          first frame-mode ack ? both harmless
+ *   frame -> idle        : *stop# passed its check ? stopped frame, then
+ *                          OK envelope
+ *   frame -> continuous  : *START# ? ASCII OK_START already sent, no
+ *                          envelope (would pollute the ASCII stream)
+ *   idle/cont -> not frame: ASCII acks as before, no envelope
+ */
+static void process_cmd(void) {
+    bool was_frame = (run_mode_state == MODE_FRAME);
+    cmd_failed = false;                 /* CHANGE 11: verdict for THIS command only */
+    process_cmd_dispatch();
+    bool skip_ok = suppress_frame_ok;   /* CHANGE 10 */
+    suppress_frame_ok = false;          /* always cleared, every command */
+    if (!skip_ok &&
+        (run_mode_state == MODE_FRAME ||
+         (was_frame && run_mode_state == MODE_IDLE))) {
+        /* CHANGE 11: OK if accepted, ERR if any handler reported failure. */
+        if (cmd_failed) tx_frame_err();
+        else            tx_frame_ok();
+    }
+}
+
+ISR(USART1_RXC_vect) {
+    unsigned char c = USART1.RXDATAL;
+    if (c=='*') { strt=1; rxcntr=0; }
+    if (strt==1) {
+        if (rxcntr < CMD_BUF_LEN-1) company[rxcntr++]=c;
+        if (c=='#') { company[rxcntr]='\0'; cmd_ready=true; strt=0; }
+    }
+}
+
+void USART1_init(void) {
+    PORTA.DIR &= ~PIN2_bm; PORTA.DIR |= PIN1_bm;
+    USART1.BAUD  = (uint16_t)USART1_BAUD_RATE(9600);
+    USART1.CTRLA = 0<<USART_ABEIE_bp | 0<<USART_DREIE_bp | 0<<USART_LBME_bp
+                 | 1<<USART_RS485_bp  | 1<<USART_RXCIE_bp | 0<<USART_RXSIE_bp
+                 | 0<<USART_TXCIE_bp;
+    USART1.CTRLB |= USART_RXEN_bm | USART_TXEN_bm;
+}
+
+/* ================================================================== */
+/*  PROBE STATE HELPER  (shared by continuous and frame output)        */
+/*                                                                     */
+/*  Returns the Col-10 / ST byte value:                                */
+/*   0 = WarmUp Collecting   1 = WarmUp Checking                      */
+/*   2 = Small Leaks         3 = Large Leaks                          */
+/*   4 = Leak Detected       5 = Recovery                             */
+/*   6 = Overrange           7 = Recovery from OR                     */
+/*   8 = ZeroCal after OR                                             */
+/* ================================================================== */
+static uint8_t get_probe_state(void) {
+    if (warmup_phase == WARMUP_COLLECTING) return 0;
+    if (warmup_phase == WARMUP_CHECKING)   return 1;
+    if (or_state == OR_OVERRANGE)          return 6;
+    if (or_state == OR_WAIT_DROP)          return 7;
+    if (or_state == OR_STABLE)             return 8;
+    if (II == 1.0f)                        return 4;
+    if (II == -1.0f && (II_prev == 1.0f || rec_pct < 100.0f)) return 5;
+    /* II == -1, rec_pct == 100, OR_NORMAL, warmup running */
+    uint8_t rp = (uint8_t)(rec_pct + 0.5f);
+    if (rp >= 100) {
+        bool near = (fabsf(daughter_baseline - mother_baseline) <= P.daughter_mother_prox);
+        return (near && !post_high_active) ? 2u : 3u;
+    }
+    return 5;
+}
+
+/* ================================================================== */
+/*  tx_send_int32_be ? helper used outside tx_frame (kept for reuse)  */
+/* ================================================================== */
+static void tx_send_int32_be(int32_t v) __attribute__((unused));
+static void tx_send_int32_be(int32_t v) {
+    USART1_sendChar((char)((v >> 24) & 0xFF));
+    USART1_sendChar((char)((v >> 16) & 0xFF));
+    USART1_sendChar((char)((v >>  8) & 0xFF));
+    USART1_sendChar((char)( v        & 0xFF));
+}
+
+/* ================================================================== */
+/*  CRC-16/IBM (same algorithm as Modbus reference)                    */
+/*  Calculates over `count` bytes in `buf`.                            */
+/*  Caller sends: lo byte first, then hi byte (swapped).              */
+/* ================================================================== */
+static uint16_t frame_crc16(const uint8_t *buf, uint8_t count)
+{
+    uint16_t crc = 0xFFFF;
+    for (uint8_t pos = 0; pos < count; pos++) {
+        crc ^= buf[pos];
+        for (uint8_t j = 8; j > 0; j--) {
+            if (crc & 0x0001) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+/* ================================================================== */
+/*  STOPPED OUTPUT ? emitted once when *stop# conditions are met.     */
+/*  All columns = 0 except Col 10 (ProbeState) = 9.                  */
+/*  Frame mode: ST = 9, H2 = 0, RC = 0, CRC computed normally.       */
+/* ================================================================== */
+static void tx_stopped_continuous(void) {
+    /* Stopped output: all data cols = 0/neutral, Col 10 = 9 (stopped).
+     * String columns must match expected format so host parser stays aligned.
+     * Col 1 sends actual RefR so column widths remain predictable. */
+    /* Col 1:  RefR        */ USART1_sendLong((long)Reference_Set_Value); USART1_sendChar(' ');
+    /* Col 2:  EMF_mV      */ USART1_sendStr("0.000"); USART1_sendChar(' ');
+    /* Col 3:  PPM         */ USART1_sendChar('0'); USART1_sendChar(' ');
+    /* Col 4:  Type        */ USART1_sendChar('F'); USART1_sendChar(' ');
+    /* Col 5:  H2_Flag     */ USART1_sendStr("AIR"); USART1_sendChar(' ');
+    /* Col 6:  Rec_Status  */ USART1_sendStr("100_L"); USART1_sendChar(' ');
+    /* Col 7:  OR_Status   */ USART1_sendStr("NORMAL"); USART1_sendChar(' ');
+    /* Col 8:  Warmup      */ USART1_sendChar('4'); USART1_sendChar(' ');
+    /* Col 9:  PostCnt     */ USART1_sendChar('0'); USART1_sendChar(' ');
+    /* Col 10: ProbeState  */ USART1_sendChar('9'); USART1_sendChar(' ');
+    /* Col 11: NthMode     */ USART1_sendChar('F'); USART1_sendChar(' ');
+    /* Col 12: DeltaF_mV   */ USART1_sendStr("0.0"); USART1_sendChar(' ');
+    /* Col 13: DeltaA_mV   */ USART1_sendStr("0.0");
+    USART1_sendChar(0x0D); USART1_sendChar(0x0A);
+}
+
+static void tx_stopped_frame(void) {
+    /* Data frame: ST=9, H2=0, RC=0. Diag frame: same + MV/MB/DB=0. */
+    frame_cn++;   /* keep counter incrementing */
+
+    if (frame_type == FRAME_DATA) {
+        uint8_t buf[8];
+        buf[0] = frame_cn;
+        buf[1] = 9u;                                       /* ST = 9 */
+        buf[2] = 0; buf[3] = 0; buf[4] = 0; buf[5] = 0;  /* H2 = 0 */
+        buf[6] = 0;                                        /* RC = 0 */
+        buf[7] = 0;                                        /* PC = 0 */
+        uint16_t crc = frame_crc16(buf, 8);
+        USART1_sendChar((char)0x0A);
+        for (uint8_t i = 0; i < 8; i++) USART1_sendChar((char)buf[i]);
+        USART1_sendChar((char)(crc & 0xFF));
+        USART1_sendChar((char)((crc >> 8) & 0xFF));
+        USART1_sendChar((char)0x0D);
+    } else {
+        uint8_t buf[24];       /* CHANGE 15: was 20 (+4 for DF/DA) */
+        buf[0]  = frame_cn;
+        buf[1]  = 9u;          /* ST = 9 */
+        buf[2]  = 0; buf[3]  = 0; buf[4]  = 0; buf[5]  = 0;  /* H2 = 0 */
+        buf[6]  = 0;           /* RC = 0 */
+        buf[7]  = 0; buf[8]  = 0; buf[9]  = 0; buf[10] = 0;  /* MV = 0 */
+        buf[11] = 0; buf[12] = 0; buf[13] = 0; buf[14] = 0;  /* MB = 0 */
+        buf[15] = 0; buf[16] = 0; buf[17] = 0; buf[18] = 0;  /* DB = 0 */
+        buf[19] = 0;                                          /* PC = 0 */
+        buf[20] = 0; buf[21] = 0;                             /* DF = 0 */
+        buf[22] = 0; buf[23] = 0;                             /* DA = 0 */
+        uint16_t crc = frame_crc16(buf, 24);
+        USART1_sendChar((char)0x0A);
+        for (uint8_t i = 0; i < 24; i++) USART1_sendChar((char)buf[i]);
+        USART1_sendChar((char)(crc & 0xFF));
+        USART1_sendChar((char)((crc >> 8) & 0xFF));
+        USART1_sendChar((char)0x0D);
+    }
+}
+
+/* ================================================================== */
+/*  FRAME OUTPUT                                                        */
+/*                                                                     */
+/*  Data frame  (11 bytes):                                            */
+/*   B01      0x0A  Start byte                                         */
+/*   B02      Cn    Counter (0-255, increments each frame)             */
+/*   B03      ST    ProbeState (same as Col 10)                        */
+/*   B04-B07  H2    H2 concentration ppm, big-endian int32            */
+/*   B08      RC    Recovery % (0-100, clamped)                        */
+/*   B09      PC    Post-counter active flag (0/1)                    */
+/*   B10      CRC-lo  CRC-16/IBM over B02..B09, low byte first        */
+/*   B11      CRC-hi  high byte                                        */
+/*   B12      0x0D  End byte                                           */
+/*                                                                     */
+/*  Diagnostic frame  (28 bytes):   CHANGE 15 ? was 24                 */
+/*   B01      0x0A  Start byte                                         */
+/*   B02      Cn    Counter                                            */
+/*   B03      ST    ProbeState                                         */
+/*   B04-B07  H2    H2 ppm, big-endian int32                          */
+/*   B08      RC    Recovery %                                         */
+/*   B09-B12  MV    EMF mV * 1000 as int32, big-endian               */
+/*   B13-B16  MB    Mother baseline mV * 1000 as int32, big-endian   */
+/*   B17-B20  DB    Daughter baseline mV * 1000 as int32, big-endian */
+/*   B21      PC    Post-counter active flag (0/1)                    */
+/*   B22-B23  DF    DeltaF (P_clip)  mV x10, big-endian int16         */
+/*   B24-B25  DA    DeltaA (N_accum) mV x10, big-endian int16         */
+/*   B26      CRC-lo  CRC-16/IBM over B02..B25, low byte first        */
+/*   B27      CRC-hi  high byte                                        */
+/*   B28      0x0D  End byte                                           */
+/*   (DF/DA are 1 dp CLIPPED, not rounded: value_mV = int16 / 10.0)   */
+/* ================================================================== */
+static void tx_frame(float emf_mv) {
+    rx_disable();                        /* block loopback into RX ISR */
+    uint8_t st = get_probe_state();
+
+    /* H2 ppm ? show 0 if not running normally (same rule as Col 3) */
+    long h2_ppm = (warmup_phase == WARMUP_RUNNING && or_state == OR_NORMAL) ? S_ppm : 0L;
+
+    /* Recovery % clamped to 0-100 */
+    uint8_t rc = (uint8_t)(rec_pct + 0.5f);
+    if (rc > 100) rc = 100;
+
+    /* Advance counter ? wraps naturally at 256 */
+    frame_cn++;
+
+    if (frame_type == FRAME_DATA) {
+        /* --- 12-byte data frame ---
+         * Assemble payload bytes B02..B09 into buffer, compute CRC, then transmit. */
+        uint8_t buf[8];
+        buf[0] = frame_cn;
+        buf[1] = st;
+        buf[2] = (uint8_t)(((int32_t)h2_ppm >> 24) & 0xFF);
+        buf[3] = (uint8_t)(((int32_t)h2_ppm >> 16) & 0xFF);
+        buf[4] = (uint8_t)(((int32_t)h2_ppm >>  8) & 0xFF);
+        buf[5] = (uint8_t)( (int32_t)h2_ppm        & 0xFF);
+        buf[6] = rc;
+        buf[7] = post_high_active ? 1 : 0;
+
+        uint16_t crc = frame_crc16(buf, 8);
+
+        USART1_sendChar((char)0x0A);                     /* B01 Start   */
+        USART1_sendChar((char)buf[0]);                   /* B02 Cn      */
+        USART1_sendChar((char)buf[1]);                   /* B03 ST      */
+        USART1_sendChar((char)buf[2]);                   /* B04 H2 MSB  */
+        USART1_sendChar((char)buf[3]);                   /* B05         */
+        USART1_sendChar((char)buf[4]);                   /* B06         */
+        USART1_sendChar((char)buf[5]);                   /* B07 H2 LSB  */
+        USART1_sendChar((char)buf[6]);                   /* B08 RC      */
+        USART1_sendChar((char)buf[7]);                   /* B09 PC      */
+        USART1_sendChar((char)(crc & 0xFF));             /* B10 CRC-lo  */
+        USART1_sendChar((char)((crc >> 8) & 0xFF));      /* B11 CRC-hi  */
+        USART1_sendChar((char)0x0D);                     /* B12 End     */
+
+    } else {
+        /* --- 24-byte diagnostic frame ---
+         * EMF, MB, DB encoded as int32 of (value * 1000) for 3 decimal places.
+         * Assemble payload bytes B02..B21 into buffer, compute CRC, then transmit. */
+        int32_t mv_i = (int32_t)(emf_mv            * 1000.0f);
+        int32_t mb_i = (int32_t)(mother_baseline   * 1000.0f);
+        int32_t db_i = (int32_t)(daughter_baseline * 1000.0f);
+
+        uint8_t buf[24];   /* CHANGE 15: was 20 (+4 for DF/DA) */
+        buf[0]  = frame_cn;
+        buf[1]  = st;
+        buf[2]  = (uint8_t)(((int32_t)h2_ppm >> 24) & 0xFF);
+        buf[3]  = (uint8_t)(((int32_t)h2_ppm >> 16) & 0xFF);
+        buf[4]  = (uint8_t)(((int32_t)h2_ppm >>  8) & 0xFF);
+        buf[5]  = (uint8_t)( (int32_t)h2_ppm        & 0xFF);
+        buf[6]  = rc;
+        buf[7]  = (uint8_t)((mv_i >> 24) & 0xFF);
+        buf[8]  = (uint8_t)((mv_i >> 16) & 0xFF);
+        buf[9]  = (uint8_t)((mv_i >>  8) & 0xFF);
+        buf[10] = (uint8_t)( mv_i        & 0xFF);
+        buf[11] = (uint8_t)((mb_i >> 24) & 0xFF);
+        buf[12] = (uint8_t)((mb_i >> 16) & 0xFF);
+        buf[13] = (uint8_t)((mb_i >>  8) & 0xFF);
+        buf[14] = (uint8_t)( mb_i        & 0xFF);
+        buf[15] = (uint8_t)((db_i >> 24) & 0xFF);
+        buf[16] = (uint8_t)((db_i >> 16) & 0xFF);
+        buf[17] = (uint8_t)((db_i >>  8) & 0xFF);
+        buf[18] = (uint8_t)( db_i        & 0xFF);
+        buf[19] = post_high_active ? 1 : 0;
+        /* CHANGE 15: DeltaF / DeltaA ? the exact values *1CAL reads.
+         * mV x10 as big-endian int16, 1 dp CLIPPED (not rounded). */
+        { int16_t df = emf_x10_clip(P_clip);
+          int16_t da = emf_x10_clip(N_accum);
+          buf[20] = (uint8_t)(((uint16_t)df >> 8) & 0xFF);
+          buf[21] = (uint8_t)( (uint16_t)df       & 0xFF);
+          buf[22] = (uint8_t)(((uint16_t)da >> 8) & 0xFF);
+          buf[23] = (uint8_t)( (uint16_t)da       & 0xFF); }
+
+        uint16_t crc = frame_crc16(buf, 24);
+
+        USART1_sendChar((char)0x0A);                     /* B01 Start   */
+        for (uint8_t i = 0; i < 24; i++)
+            USART1_sendChar((char)buf[i]);               /* B02-B25     */
+        USART1_sendChar((char)(crc & 0xFF));             /* B26 CRC-lo  */
+        USART1_sendChar((char)((crc >> 8) & 0xFF));      /* B27 CRC-hi  */
+        USART1_sendChar((char)0x0D);                     /* B28 End     */
+    }
+    rx_enable();                         /* restore RX ISR after TX burst */
+}
+
+/* ================================================================== */
+/*  OUTPUT LINE ? continuous ASCII columns                             */
+/* ================================================================== */
+static void tx_output_line(float emf_mv) {
+    rx_disable();                        /* block loopback into RX ISR */
+    /* Col 1: RefR */
+    USART1_sendLong((long)Reference_Set_Value);
+    USART1_sendChar(' ');
+
+    /* Col 2: EMF_mV */
+    USART1_sendFloat(emf_mv, 3);
+    USART1_sendChar(' ');
+
+    /* Col 3: DispPPM */
+    {
+        long d = (warmup_phase == WARMUP_RUNNING && or_state == OR_NORMAL) ? S_ppm : 0L;
+        USART1_sendLong(d);
+    }
+    USART1_sendChar(' ');
+
+    /* Col 4: Type */
+    USART1_sendChar((Q_ppm >= R_ppm) ? 'F' : 'A');
+    USART1_sendChar(' ');
+
+    /* Col 5: H2_Flag */
+    {
+        const char *flag;
+        bool in_or = (or_state != OR_NORMAL);
+        if (in_or || warmup_phase != WARMUP_RUNNING) {
+            flag = "AIR";
+        } else if (II == 1.0f) {
+            flag = "UP";
+        } else if (II == -1.0f && II_prev == 1.0f) {
+            flag = "DOWN";
+        } else if (II == -1.0f && rec_pct < 100.0f) {
+            flag = "REC";
+        } else {
+            flag = "AIR";
+        }
+        USART1_sendStr(flag);
+    }
+    USART1_sendChar(' ');
+
+    /* Col 6: Rec_Status */
+    {
+        uint8_t rp = (uint8_t)(rec_pct + 0.5f);
+        if (rp > 100) rp = 100;
+        if (rp == 100) {
+            if (post_high_active) {
+                USART1_sendStr("100_H");
+            } else {
+                bool near = (fabsf(daughter_baseline - mother_baseline) <= P.daughter_mother_prox);
+                USART1_sendStr(near ? "100_L" : "100_H");
+            }
+        } else {
+            USART1_sendUInt(rp);
+        }
+    }
+    USART1_sendChar(' ');
+
+    /* Col 7: OR_Status */
+    {
+        const char *ors;
+        switch (or_state) {
+            case OR_OVERRANGE: ors = "OVERRANGE";  break;
+            case OR_WAIT_DROP: ors = "WAIT_DROP";  break;
+            case OR_STABLE:    ors = "PRESS_TARE"; break;
+            default:           ors = "NORMAL";     break;
+        }
+        USART1_sendStr(ors);
+    }
+    USART1_sendChar(' ');
+
+    /* Col 8: Warmup
+     *   WARMUP_COLLECTING = 0  -> output 0
+     *   WARMUP_CHECKING   = 1  -> output 1
+     *   WARMUP_RUNNING    = 4  -> output 4
+     * The enum values ARE the output values -- cast directly.
+     */
+    USART1_sendUInt((uint32_t)warmup_phase);
+    USART1_sendChar(' ');
+
+    /* Col 9: PostCnt */
+    USART1_sendUInt(post_high_active ? (uint32_t)post_high_counter : 0u);
+    USART1_sendChar(' ');
+
+    /* Col 10: ProbeState ? computed by shared helper */
+    USART1_sendUInt((uint32_t)get_probe_state());
+    USART1_sendChar(' ');
+
+    /* Col 11: NthMode ? 'F' = low-ppm threshold active (ppm < NPT),
+     *                   'T' = normal threshold active  (ppm >= NPT) */
+    USART1_sendChar((S_ppm < (long)P.n_thresh_ppm_thresh) ? 'F' : 'T');
+    USART1_sendChar(' ');
+
+    /* Col 12: DeltaF_mV ? P_clip, the fast DELTA-EMF *1CAL calibrates from.
+     * Col 13: DeltaA_mV ? N_accum, the analytical DELTA-EMF (CHANGE 15).
+     * Both printed with ONE decimal place, CLIPPED not rounded. */
+    tx_1dp_trunc(P_clip);
+    USART1_sendChar(' ');
+    tx_1dp_trunc(N_accum);
+
+    USART1_sendChar(0x0D); USART1_sendChar(0x0A);
+    rx_enable();                         /* restore RX ISR after TX burst */
+}
+
+/* ================================================================== */
+/*  RUN MODE                                                           */
+/* ================================================================== */
+/*
+ * TARGET_LOOP_MS ? fixed sample period for both continuous and frame modes.
+ *
+ * Continuous mode TX (ASCII, worst case ~53 bytes) takes ~55ms at 9600 baud.
+ * Frame mode TX (11 bytes binary) takes only ~11.5ms.
+ * Without this governor, frame mode runs ~35% faster than continuous,
+ * causing smaller per-sample C_leaky deltas that fail to sustain the
+ * cnt_D streak (needs >upG=6 consecutive) required for detection.
+ * Setting a common floor of 90ms makes both modes run at ~11 sps,
+ * matching worst-case continuous speed ? identical detection sensitivity.
+ */
+#define TARGET_LOOP_MS   90u
+
+void run_mode(void) {
+    uint32_t loop_start = 0;
+
+    while (1) {
+        if (cmd_ready) {
+            cmd_ready = false;
+            rx_disable();
+            process_cmd();
+            /* CHANGE 8: process_cmd() now guarantees at least one TX byte
+             * in EVERY mode (frame mode always emits the 0x0A "OK" 0x0D
+             * ack), so TXCIF is always set and the full rx_enable() is
+             * always safe ? and it correctly drains the RS-485 loopback
+             * of the ack bytes. rx_enable_no_flush() no longer needed. */
+            rx_enable();
+        }
+
+        if (run_mode_state == MODE_IDLE) {
+            /* Idle only after *stop# ? wait silently for *start# or *frame# */
+            _delay_ms(100);
+            continue;
+        }
+
+        /* Pace both modes to the same loop period so detection sensitivity
+         * is identical regardless of output format. */
+        while ((millis_count - loop_start) < TARGET_LOOP_MS) {
+            if (cmd_ready) {
+                cmd_ready = false;
+                rx_disable();
+                process_cmd();
+                rx_enable();   /* always safe now ? see comment above */
+            }
+        }
+        loop_start = millis_count;
+
+        read_sensor();
+        float emf_mv = (float)sensor_final_output / 1000.0f;
+
+        engine_step(emf_mv);
+
+        if (run_mode_state == MODE_CONTINUOUS) {
+            rx_disable();
+            USART1_sendChar(0x0A);
+            tx_output_line(emf_mv);   /* rx_enable() called inside */
+        } else {
+            /* MODE_FRAME ? binary frame, no extra delay */
+            tx_frame(emf_mv);         /* rx_enable() called inside */
+        }
+    }
+}
+
+/* ================================================================== */
+/*  MAIN                                                               */
+/* ================================================================== */
+int main(void) {
+    PORTA_DIR    = 0xFF;
+    PORTA_OUTSET = ADC_RESET;
+    PORTB_DIR    = 0xFF;
+    _delay_ms(500);
+
+    InitI2C();
+    USART1_init();
+    _delay_ms(100);
+    timer_init();
+    sei();
+
+    calib_load(FAST_EE_MAGIC_ADDR, FAST_EE_DATA_ADDR, CALIB_FAST, CALIB_FAST_DEFAULT);
+    calib_load(AN_EE_MAGIC_ADDR,   AN_EE_DATA_ADDR,   CALIB_AN,   CALIB_AN_DEFAULT);
+    mb_ee_load();
+    params_ee_load();
+    scalar_ee_load();   /* loads ref_val / limit_val / offset_val independently */
+
+    /* Restore runtime scalars from the unified Params block */
+    Reference_Set_Value = P.ref_val;
+    limit               = P.limit_val;
+    offset_value        = P.offset_val;
+
+   /* Boot message: 0x0A + "MNST" + 0x0D, repeated continuously for 5 seconds */
+   {
+	   uint32_t boot_start = millis_count;
+	   while ((millis_count - boot_start) < 5000u) {
+		   rx_disable();
+		   USART1_sendChar(0x0A);
+		   USART1_sendStr("MNST");
+		   USART1_sendChar(0x0D);
+		   rx_enable();
+		   _delay_ms(200);   /* ~5 transmissions per second */
+	   }
+   }
+    run_mode_state = MODE_FRAME;
+    frame_type     = FRAME_DIAG;
+    frame_cn       = 0;
+
+    setInputMultiplexer(ADS122C04_MUX_AIN1_AIN0);
+    setGain(ADS122C04_GAIN_1);
+    enablePGA(ADS122C04_PGA_DISABLED);
+    setDataRate(ADS122C04_DATA_RATE_175SPS);
+    setOperatingMode(ADS122C04_OP_MODE_NORMAL);
+    setConversionMode(ADS122C04_CONVERSION_MODE_SINGLE_SHOT);
+    setVoltageReference(ADS122C04_VREF_INTERNAL);
+    enableInternalTempSensor(ADS122C04_TEMP_SENSOR_OFF);
+    setDataCounter(ADS122C04_DCNT_DISABLE);
+    setDataIntegrityCheck(ADS122C04_CRC_DISABLED);
+    setBurnOutCurrent(ADS122C04_BURN_OUT_CURRENT_OFF);
+    setIDACcurrent(ADS122C04_IDAC_CURRENT_OFF);
+    setIDAC1mux(ADS122C04_IDAC1_DISABLED);
+    setIDAC2mux(ADS122C04_IDAC2_DISABLED);
+    _delay_ms(5);
+
+    uint8_t rb0=0, rb1=0;
+    ADS122C04_readReg(ADS122C04_CONFIG_0_REG, &rb0);
+    ADS122C04_readReg(ADS122C04_CONFIG_1_REG, &rb1);
+    diag_dr   = (rb1 >> 5) & 0x07;
+    diag_pga  = rb0 & 0x01;
+    diag_gain = (rb0 >> 1) & 0x07;
+    set_sample_timing(diag_dr);
+
+    reset();
+    _delay_ms(2);
+    setDataRate(ADS122C04_Reg.reg1.bit.DR);
+
+    run_mode();
+}
